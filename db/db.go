@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	_ "github.com/lib/pq"
 )
@@ -46,10 +47,19 @@ type Category struct {
 }
 
 type CreditCard struct {
-	ID            int64  `json:"id"`
-	Name          string `json:"name"`
-	StatementDay  int    `json:"statement_day"`
-	PaymentDueDay int    `json:"payment_due_day"`
+	ID                    int64  `json:"id"`
+	Name                  string `json:"name"`
+	StatementDay          int    `json:"statement_day"`
+	PaymentDueDay         int    `json:"payment_due_day"`
+	PaymentDueMonthOffset int    `json:"payment_due_month_offset"`
+}
+
+type CardPurchase struct {
+	ID           int64     `json:"id"`
+	CreditCardID int64     `json:"credit_card_id"`
+	Description  string    `json:"description"`
+	Amount       float64   `json:"amount"`
+	PurchaseDate time.Time `json:"purchase_date"`
 }
 
 type RecurringItem struct {
@@ -128,7 +138,7 @@ func AddCategory(c Category) (int64, error) {
 // ---- Credit cards ----
 
 func GetCreditCards() ([]CreditCard, error) {
-	rows, err := database.Query(`SELECT id, name, statement_day, payment_due_day FROM credit_cards ORDER BY name`)
+	rows, err := database.Query(`SELECT id, name, statement_day, payment_due_day, payment_due_month_offset FROM credit_cards ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +146,7 @@ func GetCreditCards() ([]CreditCard, error) {
 	var out []CreditCard
 	for rows.Next() {
 		var c CreditCard
-		if err := rows.Scan(&c.ID, &c.Name, &c.StatementDay, &c.PaymentDueDay); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.StatementDay, &c.PaymentDueDay, &c.PaymentDueMonthOffset); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -144,21 +154,192 @@ func GetCreditCards() ([]CreditCard, error) {
 	return out, nil
 }
 
+func getCreditCard(id int64) (CreditCard, error) {
+	var c CreditCard
+	err := database.QueryRow(
+		`SELECT id, name, statement_day, payment_due_day, payment_due_month_offset FROM credit_cards WHERE id=$1`, id,
+	).Scan(&c.ID, &c.Name, &c.StatementDay, &c.PaymentDueDay, &c.PaymentDueMonthOffset)
+	return c, err
+}
+
 func AddCreditCard(c CreditCard) (int64, error) {
+	if c.PaymentDueMonthOffset == 0 {
+		c.PaymentDueMonthOffset = 1
+	}
 	var id int64
 	err := database.QueryRow(
-		`INSERT INTO credit_cards (name, statement_day, payment_due_day) VALUES ($1, $2, $3) RETURNING id`,
-		c.Name, c.StatementDay, c.PaymentDueDay,
+		`INSERT INTO credit_cards (name, statement_day, payment_due_day, payment_due_month_offset) VALUES ($1, $2, $3, $4) RETURNING id`,
+		c.Name, c.StatementDay, c.PaymentDueDay, c.PaymentDueMonthOffset,
 	).Scan(&id)
 	return id, err
 }
 
 func UpdateCreditCard(id int64, c CreditCard) error {
+	if c.PaymentDueMonthOffset == 0 {
+		c.PaymentDueMonthOffset = 1
+	}
 	_, err := database.Exec(
-		`UPDATE credit_cards SET name=$2, statement_day=$3, payment_due_day=$4 WHERE id=$1`,
-		id, c.Name, c.StatementDay, c.PaymentDueDay,
+		`UPDATE credit_cards SET name=$2, statement_day=$3, payment_due_day=$4, payment_due_month_offset=$5 WHERE id=$1`,
+		id, c.Name, c.StatementDay, c.PaymentDueDay, c.PaymentDueMonthOffset,
 	)
 	return err
+}
+
+// ---- Card purchases ----
+// Individual purchases on a card, attributed to a payment period (which
+// month's bill they land on) using that card's statement_day and
+// payment_due_month_offset -- this is the real per-transaction tracking
+// requested instead of a flat monthly estimate.
+
+// paymentPeriodFor works out which (year, month) a purchase's payment
+// falls in: first the statement it belongs to (the next statement_day
+// on/after the purchase date), then payment_due_month_offset months
+// after that statement's month.
+func paymentPeriodFor(card CreditCard, purchaseDate time.Time) (year, month int) {
+	year, month = purchaseDate.Year(), int(purchaseDate.Month())
+	if purchaseDate.Day() > card.StatementDay {
+		year, month = nextPeriod(year, month)
+	}
+	for i := 0; i < card.PaymentDueMonthOffset; i++ {
+		year, month = nextPeriod(year, month)
+	}
+	return year, month
+}
+
+// recurringItemIDForCard finds the (single, expected) monthly recurring
+// item that represents this card's payment, so its generated entry can
+// be kept in sync with actual purchases.
+func recurringItemIDForCard(cardID int64) (int64, bool, error) {
+	var id int64
+	err := database.QueryRow(`
+		SELECT id FROM recurring_items
+		WHERE credit_card_id = $1 AND frequency = 'monthly' AND active = TRUE
+		ORDER BY id LIMIT 1`, cardID,
+	).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	return id, err == nil, err
+}
+
+// recalculateCardEntry sums this card's purchases for (year, month) and
+// writes that total into the matching entry's planned_amount, generating
+// the entry first if it doesn't exist yet. actual_amount/status (once
+// you've actually paid the bill) are left untouched.
+func recalculateCardEntry(cardID int64, year, month int) error {
+	recItemID, found, err := recurringItemIDForCard(cardID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil // no recurring item wired to this card -- nothing to keep in sync
+	}
+	if _, err := GeneratePeriodEntries(year, month); err != nil {
+		return err
+	}
+
+	// Each purchase's payment period depends on paymentPeriodFor, which
+	// isn't expressible as plain SQL, so sum in Go rather than via SUM().
+	total, err := sumPurchasesForPeriod(cardID, year, month)
+	if err != nil {
+		return err
+	}
+
+	_, err = database.Exec(`
+		UPDATE entries SET planned_amount = $1
+		WHERE recurring_item_id = $2 AND period_year = $3 AND period_month = $4`,
+		total, recItemID, year, month,
+	)
+	return err
+}
+
+func sumPurchasesForPeriod(cardID int64, year, month int) (float64, error) {
+	card, err := getCreditCard(cardID)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := database.Query(`
+		SELECT amount, purchase_date FROM card_purchases WHERE credit_card_id = $1`, cardID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	var total float64
+	for rows.Next() {
+		var amount float64
+		var purchaseDate time.Time
+		if err := rows.Scan(&amount, &purchaseDate); err != nil {
+			return 0, err
+		}
+		py, pm := paymentPeriodFor(card, purchaseDate)
+		if py == year && pm == month {
+			total += amount
+		}
+	}
+	return total, nil
+}
+
+func GetCardPurchases(cardID int64) ([]CardPurchase, error) {
+	rows, err := database.Query(`
+		SELECT id, credit_card_id, description, amount, purchase_date
+		FROM card_purchases WHERE credit_card_id = $1 ORDER BY purchase_date DESC, id DESC`, cardID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CardPurchase
+	for rows.Next() {
+		var p CardPurchase
+		if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func AddCardPurchase(p CardPurchase) (int64, error) {
+	var id int64
+	err := database.QueryRow(`
+		INSERT INTO card_purchases (credit_card_id, description, amount, purchase_date)
+		VALUES ($1, $2, $3, $4) RETURNING id`,
+		p.CreditCardID, p.Description, p.Amount, p.PurchaseDate,
+	).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+
+	card, err := getCreditCard(p.CreditCardID)
+	if err != nil {
+		return id, err
+	}
+	year, month := paymentPeriodFor(card, p.PurchaseDate)
+	return id, recalculateCardEntry(p.CreditCardID, year, month)
+}
+
+func DeleteCardPurchase(id int64) error {
+	var cardID int64
+	var purchaseDate time.Time
+	err := database.QueryRow(`SELECT credit_card_id, purchase_date FROM card_purchases WHERE id=$1`, id).
+		Scan(&cardID, &purchaseDate)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if _, err := database.Exec(`DELETE FROM card_purchases WHERE id=$1`, id); err != nil {
+		return err
+	}
+
+	card, err := getCreditCard(cardID)
+	if err != nil {
+		return err
+	}
+	year, month := paymentPeriodFor(card, purchaseDate)
+	return recalculateCardEntry(cardID, year, month)
 }
 
 // ---- Recurring items (templates) ----

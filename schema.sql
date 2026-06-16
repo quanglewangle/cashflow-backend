@@ -12,13 +12,15 @@ CREATE TYPE item_frequency AS ENUM ('monthly', 'annual', 'irregular');
 CREATE TYPE entry_status AS ENUM ('planned', 'incurred');
 
 -- One row per physical credit card. statement_day/payment_due_day are
--- day-of-month numbers (1-31); payment_due_day is usually in the month
--- *after* statement_day.
+-- day-of-month numbers (1-31). payment_due_month_offset is how many
+-- calendar months after the statement closes the payment is due (all 3
+-- of the seeded cards are 1 -- confirmed with the user, not assumed).
 CREATE TABLE credit_cards (
-    id              SERIAL PRIMARY KEY,
-    name            TEXT NOT NULL UNIQUE,
-    statement_day   SMALLINT NOT NULL CHECK (statement_day BETWEEN 1 AND 31),
-    payment_due_day SMALLINT NOT NULL CHECK (payment_due_day BETWEEN 1 AND 31)
+    id                      SERIAL PRIMARY KEY,
+    name                    TEXT NOT NULL UNIQUE,
+    statement_day           SMALLINT NOT NULL CHECK (statement_day BETWEEN 1 AND 31),
+    payment_due_day         SMALLINT NOT NULL CHECK (payment_due_day BETWEEN 1 AND 31),
+    payment_due_month_offset SMALLINT NOT NULL DEFAULT 1 CHECK (payment_due_month_offset BETWEEN 1 AND 3)
 );
 
 -- Top-level grouping, mirrors the spreadsheet sections (Income / Committed / Savings).
@@ -81,6 +83,20 @@ CREATE TABLE balance_checkpoints (
     UNIQUE (period_year, period_month)
 );
 CREATE INDEX balance_checkpoints_period_idx ON balance_checkpoints (period_year, period_month);
+
+-- Individual card purchases, attributed to a statement cycle (the next
+-- statement_day on/after purchase_date) and from there to a payment
+-- period (statement month + payment_due_month_offset). Adding/editing a
+-- purchase recalculates that card's entry planned_amount for the
+-- affected payment period -- see AddCardPurchase in db.go.
+CREATE TABLE card_purchases (
+    id              SERIAL PRIMARY KEY,
+    credit_card_id  INT NOT NULL REFERENCES credit_cards(id),
+    description     TEXT NOT NULL,
+    amount          NUMERIC(10,2) NOT NULL,
+    purchase_date   DATE NOT NULL
+);
+CREATE INDEX card_purchases_card_idx ON card_purchases (credit_card_id, purchase_date);
 
 -- Seed data matching the current spreadsheet's cards.
 INSERT INTO credit_cards (name, statement_day, payment_due_day) VALUES

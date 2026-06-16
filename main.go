@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/quanglewangle/cashflow/db"
 )
@@ -154,6 +155,78 @@ func main() {
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
+	})
+
+	// GET /card-purchases?credit_card_id=N lists a card's purchases.
+	// POST /card-purchases adds one (date as "YYYY-MM-DD") and recalculates
+	// the affected month's card payment entry from the running total.
+	http.HandleFunc("/card-purchases", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			cardID, ok := intQueryParam(r, "credit_card_id")
+			if !ok {
+				writeError(w, http.StatusBadRequest, "credit_card_id required")
+				return
+			}
+			purchases, err := db.GetCardPurchases(int64(cardID))
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, purchases)
+		case http.MethodPost:
+			if !okToWrite(w, r) {
+				return
+			}
+			var body struct {
+				CreditCardID int64   `json:"credit_card_id"`
+				Description  string  `json:"description"`
+				Amount       float64 `json:"amount"`
+				PurchaseDate string  `json:"purchase_date"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid JSON")
+				return
+			}
+			date, err := time.Parse("2006-01-02", body.PurchaseDate)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "purchase_date must be YYYY-MM-DD")
+				return
+			}
+			id, err := db.AddCardPurchase(db.CardPurchase{
+				CreditCardID: body.CreditCardID,
+				Description:  body.Description,
+				Amount:       body.Amount,
+				PurchaseDate: date,
+			})
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+
+	http.HandleFunc("/card-purchases/", func(w http.ResponseWriter, r *http.Request) {
+		id, err := idFromPath(r.URL.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !okToWrite(w, r) {
+			return
+		}
+		if err := db.DeleteCardPurchase(id); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 	})
 
 	http.HandleFunc("/recurring-items", func(w http.ResponseWriter, r *http.Request) {
