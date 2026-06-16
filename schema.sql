@@ -84,17 +84,38 @@ CREATE TABLE balance_checkpoints (
 );
 CREATE INDEX balance_checkpoints_period_idx ON balance_checkpoints (period_year, period_month);
 
--- Individual card purchases, attributed to a statement cycle (the next
--- statement_day on/after purchase_date) and from there to a payment
--- period (statement month + payment_due_month_offset). Adding/editing a
--- purchase recalculates that card's entry planned_amount for the
--- affected payment period -- see AddCardPurchase in db.go.
-CREATE TABLE card_purchases (
+-- The reusable template for a card subscription (Netflix, etc.) -- same
+-- role as recurring_items, but generates card_purchases instead of
+-- entries directly, since a subscription's cost still needs to flow
+-- through the normal statement-cycle attribution (paymentPeriodFor) like
+-- any other purchase on the card.
+CREATE TABLE recurring_card_purchases (
     id              SERIAL PRIMARY KEY,
     credit_card_id  INT NOT NULL REFERENCES credit_cards(id),
     description     TEXT NOT NULL,
     amount          NUMERIC(10,2) NOT NULL,
-    purchase_date   DATE NOT NULL
+    frequency       item_frequency NOT NULL DEFAULT 'monthly',
+    day_of_month    SMALLINT NOT NULL CHECK (day_of_month BETWEEN 1 AND 31),
+    target_month    SMALLINT CHECK (target_month BETWEEN 1 AND 12), -- annual only
+    active          BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+-- Individual card purchases -- both one-off planned/actual spending (a
+-- trip's travel/accommodation/meals, dated whenever they're expected) and
+-- instances generated from recurring_card_purchases (recurring_purchase_id
+-- set). Each is attributed to a statement cycle (the next statement_day
+-- on/after purchase_date) and from there to a payment period (statement
+-- month + payment_due_month_offset). Adding/editing/deleting a purchase
+-- recalculates that card's entry planned_amount for the affected payment
+-- period -- see [Add|Update|Delete]CardPurchase in db.go.
+CREATE TABLE card_purchases (
+    id                  SERIAL PRIMARY KEY,
+    credit_card_id      INT NOT NULL REFERENCES credit_cards(id),
+    description         TEXT NOT NULL,
+    amount              NUMERIC(10,2) NOT NULL,
+    purchase_date       DATE NOT NULL,
+    recurring_purchase_id INT REFERENCES recurring_card_purchases(id),
+    UNIQUE (recurring_purchase_id, purchase_date)
 );
 CREATE INDEX card_purchases_card_idx ON card_purchases (credit_card_id, purchase_date);
 

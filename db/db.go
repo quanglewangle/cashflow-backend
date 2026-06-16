@@ -55,11 +55,27 @@ type CreditCard struct {
 }
 
 type CardPurchase struct {
-	ID           int64     `json:"id"`
-	CreditCardID int64     `json:"credit_card_id"`
-	Description  string    `json:"description"`
-	Amount       float64   `json:"amount"`
-	PurchaseDate time.Time `json:"purchase_date"`
+	ID                  int64     `json:"id"`
+	CreditCardID        int64     `json:"credit_card_id"`
+	Description         string    `json:"description"`
+	Amount              float64   `json:"amount"`
+	PurchaseDate        time.Time `json:"purchase_date"`
+	RecurringPurchaseID *int64    `json:"recurring_purchase_id"`
+}
+
+// The template for a card subscription (Netflix, etc.) -- generates
+// card_purchases (see generateRecurringCardPurchases) rather than entries
+// directly, so its cost still goes through the normal statement-cycle
+// attribution like any other purchase on the card.
+type RecurringCardPurchase struct {
+	ID           int64   `json:"id"`
+	CreditCardID int64   `json:"credit_card_id"`
+	Description  string  `json:"description"`
+	Amount       float64 `json:"amount"`
+	Frequency    string  `json:"frequency"` // monthly | annual | irregular
+	DayOfMonth   int     `json:"day_of_month"`
+	TargetMonth  *int    `json:"target_month"` // annual only
+	Active       bool    `json:"active"`
 }
 
 type RecurringItem struct {
@@ -290,7 +306,7 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, count 
 
 func GetCardPurchases(cardID int64) ([]CardPurchase, error) {
 	rows, err := database.Query(`
-		SELECT id, credit_card_id, description, amount, purchase_date
+		SELECT id, credit_card_id, description, amount, purchase_date, recurring_purchase_id
 		FROM card_purchases WHERE credit_card_id = $1 ORDER BY purchase_date DESC, id DESC`, cardID)
 	if err != nil {
 		return nil, err
@@ -299,7 +315,7 @@ func GetCardPurchases(cardID int64) ([]CardPurchase, error) {
 	var out []CardPurchase
 	for rows.Next() {
 		var p CardPurchase
-		if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate); err != nil {
+		if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate, &p.RecurringPurchaseID); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -310,9 +326,9 @@ func GetCardPurchases(cardID int64) ([]CardPurchase, error) {
 func AddCardPurchase(p CardPurchase) (int64, error) {
 	var id int64
 	err := database.QueryRow(`
-		INSERT INTO card_purchases (credit_card_id, description, amount, purchase_date)
-		VALUES ($1, $2, $3, $4) RETURNING id`,
-		p.CreditCardID, p.Description, p.Amount, p.PurchaseDate,
+		INSERT INTO card_purchases (credit_card_id, description, amount, purchase_date, recurring_purchase_id)
+		VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		p.CreditCardID, p.Description, p.Amount, p.PurchaseDate, p.RecurringPurchaseID,
 	).Scan(&id)
 	if err != nil {
 		return 0, err
@@ -324,6 +340,41 @@ func AddCardPurchase(p CardPurchase) (int64, error) {
 	}
 	year, month := paymentPeriodFor(card, p.PurchaseDate)
 	return id, recalculateCardEntry(p.CreditCardID, year, month)
+}
+
+// UpdateCardPurchase edits a (manually-added) purchase's description/amount/
+// date, recalculating both its old and new payment period -- editing the
+// date can move it from one card payment entry to another.
+func UpdateCardPurchase(id int64, p CardPurchase) error {
+	var oldCardID int64
+	var oldDate time.Time
+	err := database.QueryRow(`SELECT credit_card_id, purchase_date FROM card_purchases WHERE id=$1`, id).
+		Scan(&oldCardID, &oldDate)
+	if err != nil {
+		return err
+	}
+
+	if _, err := database.Exec(`
+		UPDATE card_purchases SET description=$2, amount=$3, purchase_date=$4 WHERE id=$1`,
+		id, p.Description, p.Amount, p.PurchaseDate,
+	); err != nil {
+		return err
+	}
+
+	oldCard, err := getCreditCard(oldCardID)
+	if err != nil {
+		return err
+	}
+	oldYear, oldMonth := paymentPeriodFor(oldCard, oldDate)
+	if err := recalculateCardEntry(oldCardID, oldYear, oldMonth); err != nil {
+		return err
+	}
+
+	newYear, newMonth := paymentPeriodFor(oldCard, p.PurchaseDate)
+	if newYear == oldYear && newMonth == oldMonth {
+		return nil
+	}
+	return recalculateCardEntry(oldCardID, newYear, newMonth)
 }
 
 func DeleteCardPurchase(id int64) error {
@@ -511,7 +562,137 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 			created++
 		}
 	}
+
+	// Also materialize this calendar month's subscription instances. Note
+	// (year, month) here is whatever period is currently being touched --
+	// when called as a payment period it's "off" from the statement month
+	// that actually feeds it, but Forecast/Grid sweep many consecutive
+	// months, so every calendar month gets its own call eventually, and
+	// each generated purchase recalculates whichever future entry it
+	// belongs to regardless of which month triggered its generation.
+	if _, err := generateRecurringCardPurchases(year, month); err != nil {
+		return created, err
+	}
+
 	return created, nil
+}
+
+// generateRecurringCardPurchases creates this calendar month's card_purchases
+// instance for each active recurring_card_purchases template (idempotent --
+// see card_purchases' (recurring_purchase_id, purchase_date) unique
+// constraint), then recalculates whichever payment-period entry each new
+// instance affects.
+func generateRecurringCardPurchases(year, month int) (int, error) {
+	rows, err := database.Query(`
+		SELECT id, credit_card_id, description, amount, day_of_month
+		FROM recurring_card_purchases
+		WHERE active = TRUE
+		  AND (frequency = 'monthly' OR (frequency = 'annual' AND target_month = $1))`, month)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type tmpl struct {
+		id           int64
+		creditCardID int64
+		description  string
+		amount       float64
+		dayOfMonth   int
+	}
+	var templates []tmpl
+	for rows.Next() {
+		var t tmpl
+		if err := rows.Scan(&t.id, &t.creditCardID, &t.description, &t.amount, &t.dayOfMonth); err != nil {
+			return 0, err
+		}
+		templates = append(templates, t)
+	}
+
+	created := 0
+	for _, t := range templates {
+		day := t.dayOfMonth
+		if lastDay := daysInMonth(year, month); day > lastDay {
+			day = lastDay
+		}
+		date := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+
+		var newID int64
+		err := database.QueryRow(`
+			INSERT INTO card_purchases (credit_card_id, description, amount, purchase_date, recurring_purchase_id)
+			VALUES ($1,$2,$3,$4,$5)
+			ON CONFLICT (recurring_purchase_id, purchase_date) DO NOTHING
+			RETURNING id`,
+			t.creditCardID, t.description, t.amount, date, t.id,
+		).Scan(&newID)
+		if err == sql.ErrNoRows {
+			continue // already generated for this month
+		}
+		if err != nil {
+			return created, err
+		}
+		created++
+
+		card, err := getCreditCard(t.creditCardID)
+		if err != nil {
+			return created, err
+		}
+		py, pm := paymentPeriodFor(card, date)
+		if err := recalculateCardEntry(t.creditCardID, py, pm); err != nil {
+			return created, err
+		}
+	}
+	return created, nil
+}
+
+func daysInMonth(year, month int) int {
+	return time.Date(year, time.Month(month)+1, 0, 0, 0, 0, 0, time.UTC).Day()
+}
+
+// ---- Recurring card purchases (subscription templates) ----
+
+func GetRecurringCardPurchases(cardID int64) ([]RecurringCardPurchase, error) {
+	rows, err := database.Query(`
+		SELECT id, credit_card_id, description, amount, frequency, day_of_month, target_month, active
+		FROM recurring_card_purchases WHERE credit_card_id = $1 ORDER BY description`, cardID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RecurringCardPurchase
+	for rows.Next() {
+		var r RecurringCardPurchase
+		if err := rows.Scan(&r.ID, &r.CreditCardID, &r.Description, &r.Amount, &r.Frequency, &r.DayOfMonth, &r.TargetMonth, &r.Active); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func AddRecurringCardPurchase(r RecurringCardPurchase) (int64, error) {
+	var id int64
+	err := database.QueryRow(`
+		INSERT INTO recurring_card_purchases (credit_card_id, description, amount, frequency, day_of_month, target_month, active)
+		VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+		r.CreditCardID, r.Description, r.Amount, r.Frequency, r.DayOfMonth, r.TargetMonth, r.Active,
+	).Scan(&id)
+	return id, err
+}
+
+func UpdateRecurringCardPurchase(id int64, r RecurringCardPurchase) error {
+	_, err := database.Exec(`
+		UPDATE recurring_card_purchases SET
+			description=$2, amount=$3, frequency=$4, day_of_month=$5, target_month=$6, active=$7
+		WHERE id=$1`,
+		id, r.Description, r.Amount, r.Frequency, r.DayOfMonth, r.TargetMonth, r.Active,
+	)
+	return err
+}
+
+func DeleteRecurringCardPurchase(id int64) error {
+	_, err := database.Exec(`DELETE FROM recurring_card_purchases WHERE id=$1`, id)
+	return err
 }
 
 // ---- Balance checkpoints ----

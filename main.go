@@ -215,18 +215,119 @@ func main() {
 			writeError(w, http.StatusBadRequest, "invalid id")
 			return
 		}
-		if r.Method != http.MethodDelete {
+		switch r.Method {
+		case http.MethodPut:
+			if !okToWrite(w, r) {
+				return
+			}
+			var body struct {
+				Description  string  `json:"description"`
+				Amount       float64 `json:"amount"`
+				PurchaseDate string  `json:"purchase_date"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid JSON")
+				return
+			}
+			date, err := time.Parse("2006-01-02", body.PurchaseDate)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "purchase_date must be YYYY-MM-DD")
+				return
+			}
+			if err := db.UpdateCardPurchase(id, db.CardPurchase{
+				Description:  body.Description,
+				Amount:       body.Amount,
+				PurchaseDate: date,
+			}); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+		case http.MethodDelete:
+			if !okToWrite(w, r) {
+				return
+			}
+			if err := db.DeleteCardPurchase(id); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+
+	// GET /recurring-card-purchases?credit_card_id=N lists a card's subscription
+	// templates. POST adds one; PUT/DELETE /recurring-card-purchases/{id} edit
+	// or remove one. Generation into card_purchases happens automatically
+	// inside GeneratePeriodEntries (see /periods/generate and forecasting).
+	http.HandleFunc("/recurring-card-purchases", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			cardID, ok := intQueryParam(r, "credit_card_id")
+			if !ok {
+				writeError(w, http.StatusBadRequest, "credit_card_id required")
+				return
+			}
+			items, err := db.GetRecurringCardPurchases(int64(cardID))
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, items)
+		case http.MethodPost:
+			if !okToWrite(w, r) {
+				return
+			}
+			var item db.RecurringCardPurchase
+			if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid JSON")
+				return
+			}
+			id, err := db.AddRecurringCardPurchase(item)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+
+	http.HandleFunc("/recurring-card-purchases/", func(w http.ResponseWriter, r *http.Request) {
+		id, err := idFromPath(r.URL.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
 			return
 		}
-		if !okToWrite(w, r) {
-			return
+		switch r.Method {
+		case http.MethodPut:
+			if !okToWrite(w, r) {
+				return
+			}
+			var item db.RecurringCardPurchase
+			if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid JSON")
+				return
+			}
+			if err := db.UpdateRecurringCardPurchase(id, item); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+		case http.MethodDelete:
+			if !okToWrite(w, r) {
+				return
+			}
+			if err := db.DeleteRecurringCardPurchase(id); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
-		if err := db.DeleteCardPurchase(id); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 	})
 
 	http.HandleFunc("/recurring-items", func(w http.ResponseWriter, r *http.Request) {
