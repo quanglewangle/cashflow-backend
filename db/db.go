@@ -226,37 +226,52 @@ func paymentPeriodFor(card CreditCard, purchaseDate time.Time) (year, month int)
 // that represents this card's payment, so its generated entry can be kept
 // in sync with actual purchases -- and so there's a default_amount to fall
 // back to for periods nothing has been logged against yet.
-func recurringItemForCard(cardID int64) (id int64, defaultAmount float64, found bool, err error) {
+type cardRecurringItem struct {
+	id            int64
+	categoryID    int64
+	name          string
+	itemType      string
+	defaultAmount float64
+}
+
+func recurringItemForCard(cardID int64) (item cardRecurringItem, found bool, err error) {
 	var amount sql.NullFloat64
 	err = database.QueryRow(`
-		SELECT id, default_amount FROM recurring_items
+		SELECT id, category_id, name, item_type, default_amount FROM recurring_items
 		WHERE credit_card_id = $1 AND frequency = 'monthly' AND active = TRUE
 		ORDER BY id LIMIT 1`, cardID,
-	).Scan(&id, &amount)
+	).Scan(&item.id, &item.categoryID, &item.name, &item.itemType, &amount)
 	if err == sql.ErrNoRows {
-		return 0, 0, false, nil
+		return cardRecurringItem{}, false, nil
 	}
-	return id, amount.Float64, err == nil, err
+	item.defaultAmount = amount.Float64
+	return item, err == nil, err
 }
 
 // recalculateCardEntry sums this card's logged purchases for (year, month)
-// and writes that total into the matching entry's planned_amount,
-// generating the entry first if it doesn't exist yet. If nothing has been
-// logged for that period at all, it falls back to the recurring item's
-// flat default_amount estimate instead of forcing the entry to zero --
-// otherwise a month you haven't started tracking purchases for yet would
-// silently look like it costs nothing. actual_amount/status (once you've
-// actually paid the bill) are always left untouched.
+// and upserts that total directly into the matching entry's planned_amount
+// -- creating the entry itself if needed, scoped to just this one
+// (recurring_item_id, year, month). If nothing has been logged for that
+// period at all, it falls back to the recurring item's flat default_amount
+// estimate instead of forcing the entry to zero -- otherwise a month you
+// haven't started tracking purchases for yet would silently look like it
+// costs nothing. actual_amount/status (once you've actually paid the bill)
+// are always left untouched.
+//
+// Deliberately does NOT call GeneratePeriodEntries: that generates every
+// recurring item AND every card's subscriptions for the period, and
+// subscriptions call back into this function for *their own* future
+// payment period -- which previously cascaded forward one month at a time,
+// forever (a generated subscription recalculates next month's entry, which
+// generated that month's subscriptions, recalculating the month after, ...).
+// This function only ever touches the single entry it's responsible for.
 func recalculateCardEntry(cardID int64, year, month int) error {
-	recItemID, defaultAmount, found, err := recurringItemForCard(cardID)
+	item, found, err := recurringItemForCard(cardID)
 	if err != nil {
 		return err
 	}
 	if !found {
 		return nil // no recurring item wired to this card -- nothing to keep in sync
-	}
-	if _, err := GeneratePeriodEntries(year, month); err != nil {
-		return err
 	}
 
 	// Each purchase's payment period depends on paymentPeriodFor, which
@@ -266,13 +281,14 @@ func recalculateCardEntry(cardID int64, year, month int) error {
 		return err
 	}
 	if count == 0 {
-		total = defaultAmount
+		total = item.defaultAmount
 	}
 
 	_, err = database.Exec(`
-		UPDATE entries SET planned_amount = $1
-		WHERE recurring_item_id = $2 AND period_year = $3 AND period_month = $4`,
-		total, recItemID, year, month,
+		INSERT INTO entries (recurring_item_id, category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		ON CONFLICT (recurring_item_id, period_year, period_month) DO UPDATE SET planned_amount = $7`,
+		item.id, item.categoryID, year, month, item.name, item.itemType, total, cardID,
 	)
 	return err
 }
