@@ -112,6 +112,7 @@ type BalanceCheckpoint struct {
 	ID          int64   `json:"id"`
 	PeriodYear  int     `json:"period_year"`
 	PeriodMonth int     `json:"period_month"`
+	PeriodDay   int     `json:"period_day"`
 	Balance     float64 `json:"balance"`
 }
 
@@ -763,8 +764,8 @@ func DeleteRecurringCardPurchase(id int64) error {
 
 func GetCheckpoints() ([]BalanceCheckpoint, error) {
 	rows, err := database.Query(`
-		SELECT id, period_year, period_month, balance FROM balance_checkpoints
-		ORDER BY period_year, period_month`)
+		SELECT id, period_year, period_month, period_day, balance FROM balance_checkpoints
+		ORDER BY period_year, period_month, period_day`)
 	if err != nil {
 		return nil, err
 	}
@@ -772,7 +773,7 @@ func GetCheckpoints() ([]BalanceCheckpoint, error) {
 	var out []BalanceCheckpoint
 	for rows.Next() {
 		var c BalanceCheckpoint
-		if err := rows.Scan(&c.ID, &c.PeriodYear, &c.PeriodMonth, &c.Balance); err != nil {
+		if err := rows.Scan(&c.ID, &c.PeriodYear, &c.PeriodMonth, &c.PeriodDay, &c.Balance); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -780,31 +781,31 @@ func GetCheckpoints() ([]BalanceCheckpoint, error) {
 	return out, nil
 }
 
-// AddCheckpoint records (or replaces) the known balance for a period, e.g.
-// after checking the real bank app. Forecast uses the latest checkpoint
-// at/before a period as its base, so this is how drift gets corrected.
-func AddCheckpoint(year, month int, balance float64) (int64, error) {
+// AddCheckpoint records (or replaces) the known balance for a specific day,
+// e.g. after checking the real bank app mid-month.
+func AddCheckpoint(year, month, day int, balance float64) (int64, error) {
 	var id int64
 	err := database.QueryRow(`
-		INSERT INTO balance_checkpoints (period_year, period_month, balance)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (period_year, period_month) DO UPDATE SET balance = $3
+		INSERT INTO balance_checkpoints (period_year, period_month, period_day, balance)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (period_year, period_month, period_day) DO UPDATE SET balance = $4
 		RETURNING id`,
-		year, month, balance,
+		year, month, day, balance,
 	).Scan(&id)
 	return id, err
 }
 
 // latestCheckpointAtOrBefore finds the most recent checkpoint at or before
-// (year, month) to use as the forecast's starting point.
+// (year, month) to use as the forecast's starting point. Any checkpoint
+// within the requested month qualifies (day is ignored for month-level forecasts).
 func latestCheckpointAtOrBefore(year, month int) (BalanceCheckpoint, bool, error) {
 	var c BalanceCheckpoint
 	err := database.QueryRow(`
-		SELECT id, period_year, period_month, balance FROM balance_checkpoints
+		SELECT id, period_year, period_month, period_day, balance FROM balance_checkpoints
 		WHERE period_year < $1 OR (period_year = $1 AND period_month <= $2)
-		ORDER BY period_year DESC, period_month DESC
+		ORDER BY period_year DESC, period_month DESC, period_day DESC
 		LIMIT 1`, year, month,
-	).Scan(&c.ID, &c.PeriodYear, &c.PeriodMonth, &c.Balance)
+	).Scan(&c.ID, &c.PeriodYear, &c.PeriodMonth, &c.PeriodDay, &c.Balance)
 	if err == sql.ErrNoRows {
 		return BalanceCheckpoint{}, false, nil
 	}

@@ -551,7 +551,10 @@ func main() {
 				writeError(w, http.StatusBadRequest, "invalid JSON")
 				return
 			}
-			id, err := db.AddCheckpoint(c.PeriodYear, c.PeriodMonth, c.Balance)
+			if c.PeriodDay == 0 {
+				c.PeriodDay = 1
+			}
+			id, err := db.AddCheckpoint(c.PeriodYear, c.PeriodMonth, c.PeriodDay, c.Balance)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
