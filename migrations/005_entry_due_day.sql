@@ -1,0 +1,1 @@
+ALTER TABLE entries ADD COLUMN due_day SMALLINT CHECK (due_day BETWEEN 1 AND 31);

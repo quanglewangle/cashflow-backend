@@ -105,6 +105,7 @@ type Entry struct {
 	ActualAmount    *float64 `json:"actual_amount"`
 	Status          string   `json:"status"` // planned | incurred
 	CreditCardID    *int64   `json:"credit_card_id"`
+	DueDay          *int     `json:"due_day"`
 }
 
 type BalanceCheckpoint struct {
@@ -475,8 +476,8 @@ func DeleteRecurringItem(id int64) error {
 func GetEntries(year, month int) ([]Entry, error) {
 	rows, err := database.Query(`
 		SELECT id, recurring_item_id, category_id, period_year, period_month,
-		       name, item_type, planned_amount, actual_amount, status, credit_card_id
-		FROM entries WHERE period_year=$1 AND period_month=$2 ORDER BY id`, year, month)
+		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day
+		FROM entries WHERE period_year=$1 AND period_month=$2 ORDER BY due_day NULLS LAST, id`, year, month)
 	if err != nil {
 		return nil, err
 	}
@@ -485,7 +486,7 @@ func GetEntries(year, month int) ([]Entry, error) {
 	for rows.Next() {
 		var e Entry
 		if err := rows.Scan(&e.ID, &e.RecurringItemID, &e.CategoryID, &e.PeriodYear, &e.PeriodMonth,
-			&e.Name, &e.ItemType, &e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID); err != nil {
+			&e.Name, &e.ItemType, &e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID, &e.DueDay); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -498,10 +499,10 @@ func AddEntry(e Entry) (int64, error) {
 	err := database.QueryRow(`
 		INSERT INTO entries
 			(recurring_item_id, category_id, period_year, period_month, name, item_type,
-			 planned_amount, actual_amount, status, credit_card_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+			 planned_amount, actual_amount, status, credit_card_id, due_day)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
 		e.RecurringItemID, e.CategoryID, e.PeriodYear, e.PeriodMonth, e.Name, e.ItemType,
-		e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID,
+		e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID, e.DueDay,
 	).Scan(&id)
 	return id, err
 }
@@ -510,9 +511,9 @@ func UpdateEntry(id int64, e Entry) error {
 	_, err := database.Exec(`
 		UPDATE entries SET
 			category_id=$2, name=$3, item_type=$4, planned_amount=$5,
-			actual_amount=$6, status=$7, credit_card_id=$8
+			actual_amount=$6, status=$7, credit_card_id=$8, due_day=$9
 		WHERE id=$1`,
-		id, e.CategoryID, e.Name, e.ItemType, e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID,
+		id, e.CategoryID, e.Name, e.ItemType, e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID, e.DueDay,
 	)
 	return err
 }
@@ -533,7 +534,7 @@ func DeleteEntry(id int64) error {
 //   - irregular items: never auto-generated; added ad-hoc via AddEntry.
 func GeneratePeriodEntries(year, month int) (int, error) {
 	rows, err := database.Query(`
-		SELECT id, category_id, name, item_type, frequency, default_amount, anchor_date, credit_card_id
+		SELECT id, category_id, name, item_type, frequency, default_amount, anchor_date, credit_card_id, due_day
 		FROM recurring_items
 		WHERE active = TRUE
 		  AND (frequency = 'monthly'
@@ -553,11 +554,12 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		defaultAmount *float64
 		anchorDate    *time.Time
 		creditCardID  *int64
+		dueDay        *int
 	}
 	var templates []tmpl
 	for rows.Next() {
 		var t tmpl
-		if err := rows.Scan(&t.id, &t.categoryID, &t.name, &t.itemType, &t.frequency, &t.defaultAmount, &t.anchorDate, &t.creditCardID); err != nil {
+		if err := rows.Scan(&t.id, &t.categoryID, &t.name, &t.itemType, &t.frequency, &t.defaultAmount, &t.anchorDate, &t.creditCardID, &t.dueDay); err != nil {
 			return 0, err
 		}
 		templates = append(templates, t)
@@ -579,10 +581,10 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		}
 
 		res, err := database.Exec(`
-			INSERT INTO entries (recurring_item_id, category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+			INSERT INTO entries (recurring_item_id, category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id, due_day)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 			ON CONFLICT (recurring_item_id, period_year, period_month) DO NOTHING`,
-			t.id, t.categoryID, year, month, t.name, t.itemType, amount, t.creditCardID,
+			t.id, t.categoryID, year, month, t.name, t.itemType, amount, t.creditCardID, t.dueDay,
 		)
 		if err != nil {
 			return created, err
