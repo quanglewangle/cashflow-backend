@@ -67,15 +67,20 @@ CREATE TABLE entries (
 );
 CREATE INDEX entries_period_idx ON entries (period_year, period_month);
 
--- Single-row table: the known balance at the point tracking starts.
--- Every period's brought-forward/carried-forward figure is computed from
--- this plus the entries, rather than stored and allowed to drift.
-CREATE TABLE settings (
-    id              BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
-    opening_balance NUMERIC(10,2) NOT NULL DEFAULT 0,
-    opening_year    SMALLINT NOT NULL,
-    opening_month   SMALLINT NOT NULL CHECK (opening_month BETWEEN 1 AND 12)
+-- Known-good balances, checked against the real bank app from time to
+-- time (same habit as the spreadsheet's hand-typed "brought forward").
+-- Forecast() uses the most recent checkpoint at/before the requested
+-- period as its base and walks forward from there -- add a new
+-- checkpoint any time to correct drift (cash spending, interest, fees,
+-- etc. that no entry captures) without touching earlier months.
+CREATE TABLE balance_checkpoints (
+    id           SERIAL PRIMARY KEY,
+    period_year  SMALLINT NOT NULL,
+    period_month SMALLINT NOT NULL CHECK (period_month BETWEEN 1 AND 12),
+    balance      NUMERIC(10,2) NOT NULL,
+    UNIQUE (period_year, period_month)
 );
+CREATE INDEX balance_checkpoints_period_idx ON balance_checkpoints (period_year, period_month);
 
 -- Seed data matching the current spreadsheet's cards.
 INSERT INTO credit_cards (name, statement_day, payment_due_day) VALUES
@@ -90,7 +95,7 @@ INSERT INTO categories (name, item_type, sort_order) VALUES
     ('Committed', 'expense', 1),
     ('Savings',   'savings', 2);
 
--- Opening balance: edit this to today's actual balance/period before first use
--- (PUT /settings from the app does the same thing later).
-INSERT INTO settings (opening_balance, opening_year, opening_month) VALUES
-    (0, EXTRACT(YEAR FROM CURRENT_DATE)::SMALLINT, EXTRACT(MONTH FROM CURRENT_DATE)::SMALLINT);
+-- Starting checkpoint: edit the balance to today's actual figure before
+-- first use (POST /checkpoints from the app adds new ones later).
+INSERT INTO balance_checkpoints (period_year, period_month, balance) VALUES
+    (EXTRACT(YEAR FROM CURRENT_DATE)::SMALLINT, EXTRACT(MONTH FROM CURRENT_DATE)::SMALLINT, 0);

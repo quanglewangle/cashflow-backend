@@ -355,29 +355,34 @@ func main() {
 		writeJSON(w, http.StatusOK, summaries)
 	})
 
-	http.HandleFunc("/settings", func(w http.ResponseWriter, r *http.Request) {
+	// GET /checkpoints lists every known-good balance recorded so far.
+	// POST /checkpoints adds (or replaces, if the period already has one)
+	// a checkpoint -- e.g. after checking the real bank app -- which
+	// Forecast then re-anchors to instead of drifting forever.
+	http.HandleFunc("/checkpoints", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			s, err := db.GetSettings()
+			checkpoints, err := db.GetCheckpoints()
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			writeJSON(w, http.StatusOK, s)
-		case http.MethodPut:
+			writeJSON(w, http.StatusOK, checkpoints)
+		case http.MethodPost:
 			if !okToWrite(w, r) {
 				return
 			}
-			var s db.Settings
-			if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+			var c db.BalanceCheckpoint
+			if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
 				writeError(w, http.StatusBadRequest, "invalid JSON")
 				return
 			}
-			if err := db.PutSettings(s); err != nil {
+			id, err := db.AddCheckpoint(c.PeriodYear, c.PeriodMonth, c.Balance)
+			if err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+			writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}

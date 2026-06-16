@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 
@@ -79,10 +80,11 @@ type Entry struct {
 	CreditCardID    *int64   `json:"credit_card_id"`
 }
 
-type Settings struct {
-	OpeningBalance float64 `json:"opening_balance"`
-	OpeningYear    int     `json:"opening_year"`
-	OpeningMonth   int     `json:"opening_month"`
+type BalanceCheckpoint struct {
+	ID          int64   `json:"id"`
+	PeriodYear  int     `json:"period_year"`
+	PeriodMonth int     `json:"period_month"`
+	Balance     float64 `json:"balance"`
 }
 
 type ForecastSummary struct {
@@ -323,23 +325,56 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 	return created, nil
 }
 
-// ---- Settings ----
+// ---- Balance checkpoints ----
 
-func GetSettings() (Settings, error) {
-	var s Settings
-	err := database.QueryRow(`SELECT opening_balance, opening_year, opening_month FROM settings WHERE id = TRUE`).
-		Scan(&s.OpeningBalance, &s.OpeningYear, &s.OpeningMonth)
-	return s, err
+func GetCheckpoints() ([]BalanceCheckpoint, error) {
+	rows, err := database.Query(`
+		SELECT id, period_year, period_month, balance FROM balance_checkpoints
+		ORDER BY period_year, period_month`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BalanceCheckpoint
+	for rows.Next() {
+		var c BalanceCheckpoint
+		if err := rows.Scan(&c.ID, &c.PeriodYear, &c.PeriodMonth, &c.Balance); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, nil
 }
 
-func PutSettings(s Settings) error {
-	_, err := database.Exec(`
-		INSERT INTO settings (id, opening_balance, opening_year, opening_month)
-		VALUES (TRUE, $1, $2, $3)
-		ON CONFLICT (id) DO UPDATE SET opening_balance=$1, opening_year=$2, opening_month=$3`,
-		s.OpeningBalance, s.OpeningYear, s.OpeningMonth,
-	)
-	return err
+// AddCheckpoint records (or replaces) the known balance for a period, e.g.
+// after checking the real bank app. Forecast uses the latest checkpoint
+// at/before a period as its base, so this is how drift gets corrected.
+func AddCheckpoint(year, month int, balance float64) (int64, error) {
+	var id int64
+	err := database.QueryRow(`
+		INSERT INTO balance_checkpoints (period_year, period_month, balance)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (period_year, period_month) DO UPDATE SET balance = $3
+		RETURNING id`,
+		year, month, balance,
+	).Scan(&id)
+	return id, err
+}
+
+// latestCheckpointAtOrBefore finds the most recent checkpoint at or before
+// (year, month) to use as the forecast's starting point.
+func latestCheckpointAtOrBefore(year, month int) (BalanceCheckpoint, bool, error) {
+	var c BalanceCheckpoint
+	err := database.QueryRow(`
+		SELECT id, period_year, period_month, balance FROM balance_checkpoints
+		WHERE period_year < $1 OR (period_year = $1 AND period_month <= $2)
+		ORDER BY period_year DESC, period_month DESC
+		LIMIT 1`, year, month,
+	).Scan(&c.ID, &c.PeriodYear, &c.PeriodMonth, &c.Balance)
+	if err == sql.ErrNoRows {
+		return BalanceCheckpoint{}, false, nil
+	}
+	return c, err == nil, err
 }
 
 // ---- Forecast ----
@@ -387,13 +422,16 @@ func nextPeriod(year, month int) (int, int) {
 // (Cashflow history is short-lived in practice -- a handful of years at
 // most -- so this is simple and always consistent, never stored/drifted.)
 func Forecast(year, month int) (ForecastSummary, error) {
-	settings, err := GetSettings()
+	checkpoint, found, err := latestCheckpointAtOrBefore(year, month)
 	if err != nil {
 		return ForecastSummary{}, err
 	}
+	if !found {
+		return ForecastSummary{}, errors.New("no balance checkpoint at or before this period -- add one via POST /checkpoints")
+	}
 
-	balance := settings.OpeningBalance
-	y, m := settings.OpeningYear, settings.OpeningMonth
+	balance := checkpoint.Balance
+	y, m := checkpoint.PeriodYear, checkpoint.PeriodMonth
 	for y < year || (y == year && m < month) {
 		inc, exp, sav, err := periodNet(y, m)
 		if err != nil {
@@ -421,13 +459,16 @@ func Forecast(year, month int) (ForecastSummary, error) {
 // ForecastRange computes consecutive period summaries from (fromYear,
 // fromMonth) for `count` months, in one forward pass.
 func ForecastRange(fromYear, fromMonth, count int) ([]ForecastSummary, error) {
-	settings, err := GetSettings()
+	checkpoint, found, err := latestCheckpointAtOrBefore(fromYear, fromMonth)
 	if err != nil {
 		return nil, err
 	}
+	if !found {
+		return nil, errors.New("no balance checkpoint at or before this period -- add one via POST /checkpoints")
+	}
 
-	balance := settings.OpeningBalance
-	y, m := settings.OpeningYear, settings.OpeningMonth
+	balance := checkpoint.Balance
+	y, m := checkpoint.PeriodYear, checkpoint.PeriodMonth
 	for y < fromYear || (y == fromYear && m < fromMonth) {
 		inc, exp, sav, err := periodNet(y, m)
 		if err != nil {
