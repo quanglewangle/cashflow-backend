@@ -381,7 +381,14 @@ func latestCheckpointAtOrBefore(year, month int) (BalanceCheckpoint, bool, error
 
 // periodNet returns income, expense, savings totals for one period, using
 // actual_amount where the entry is incurred and planned_amount otherwise.
+// Materializes the period's entries from templates first (idempotent) so
+// forecasting a month nobody has opened yet still reflects the templates,
+// instead of silently showing zero until someone visits it.
 func periodNet(year, month int) (income, expense, savings float64, err error) {
+	if _, err := GeneratePeriodEntries(year, month); err != nil {
+		return 0, 0, 0, err
+	}
+
 	rows, err := database.Query(`
 		SELECT item_type, COALESCE(actual_amount, planned_amount)
 		FROM entries WHERE period_year=$1 AND period_month=$2`, year, month)
