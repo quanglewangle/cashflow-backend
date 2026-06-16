@@ -206,28 +206,33 @@ func paymentPeriodFor(card CreditCard, purchaseDate time.Time) (year, month int)
 	return year, month
 }
 
-// recurringItemIDForCard finds the (single, expected) monthly recurring
-// item that represents this card's payment, so its generated entry can
-// be kept in sync with actual purchases.
-func recurringItemIDForCard(cardID int64) (int64, bool, error) {
-	var id int64
-	err := database.QueryRow(`
-		SELECT id FROM recurring_items
+// recurringItemForCard finds the (single, expected) monthly recurring item
+// that represents this card's payment, so its generated entry can be kept
+// in sync with actual purchases -- and so there's a default_amount to fall
+// back to for periods nothing has been logged against yet.
+func recurringItemForCard(cardID int64) (id int64, defaultAmount float64, found bool, err error) {
+	var amount sql.NullFloat64
+	err = database.QueryRow(`
+		SELECT id, default_amount FROM recurring_items
 		WHERE credit_card_id = $1 AND frequency = 'monthly' AND active = TRUE
 		ORDER BY id LIMIT 1`, cardID,
-	).Scan(&id)
+	).Scan(&id, &amount)
 	if err == sql.ErrNoRows {
-		return 0, false, nil
+		return 0, 0, false, nil
 	}
-	return id, err == nil, err
+	return id, amount.Float64, err == nil, err
 }
 
-// recalculateCardEntry sums this card's purchases for (year, month) and
-// writes that total into the matching entry's planned_amount, generating
-// the entry first if it doesn't exist yet. actual_amount/status (once
-// you've actually paid the bill) are left untouched.
+// recalculateCardEntry sums this card's logged purchases for (year, month)
+// and writes that total into the matching entry's planned_amount,
+// generating the entry first if it doesn't exist yet. If nothing has been
+// logged for that period at all, it falls back to the recurring item's
+// flat default_amount estimate instead of forcing the entry to zero --
+// otherwise a month you haven't started tracking purchases for yet would
+// silently look like it costs nothing. actual_amount/status (once you've
+// actually paid the bill) are always left untouched.
 func recalculateCardEntry(cardID int64, year, month int) error {
-	recItemID, found, err := recurringItemIDForCard(cardID)
+	recItemID, defaultAmount, found, err := recurringItemForCard(cardID)
 	if err != nil {
 		return err
 	}
@@ -240,9 +245,12 @@ func recalculateCardEntry(cardID int64, year, month int) error {
 
 	// Each purchase's payment period depends on paymentPeriodFor, which
 	// isn't expressible as plain SQL, so sum in Go rather than via SUM().
-	total, err := sumPurchasesForPeriod(cardID, year, month)
+	total, count, err := sumPurchasesForPeriod(cardID, year, month)
 	if err != nil {
 		return err
+	}
+	if count == 0 {
+		total = defaultAmount
 	}
 
 	_, err = database.Exec(`
@@ -253,31 +261,31 @@ func recalculateCardEntry(cardID int64, year, month int) error {
 	return err
 }
 
-func sumPurchasesForPeriod(cardID int64, year, month int) (float64, error) {
+func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, count int, err error) {
 	card, err := getCreditCard(cardID)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	rows, err := database.Query(`
 		SELECT amount, purchase_date FROM card_purchases WHERE credit_card_id = $1`, cardID)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer rows.Close()
 
-	var total float64
 	for rows.Next() {
 		var amount float64
 		var purchaseDate time.Time
 		if err := rows.Scan(&amount, &purchaseDate); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		py, pm := paymentPeriodFor(card, purchaseDate)
 		if py == year && pm == month {
 			total += amount
+			count++
 		}
 	}
-	return total, nil
+	return total, count, nil
 }
 
 func GetCardPurchases(cardID int64) ([]CardPurchase, error) {
