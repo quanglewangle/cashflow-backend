@@ -82,3 +82,15 @@ INSERT INTO credit_cards (name, statement_day, payment_due_day) VALUES
     ('Visacard',    14, 9),
     ('Barclaycard', 23, 19),
     ('Jenny''s card', 22, 19);
+
+-- Seed categories matching the spreadsheet's sections. Add more from the
+-- app any time -- this is just enough to get started.
+INSERT INTO categories (name, item_type, sort_order) VALUES
+    ('Income',    'income',  0),
+    ('Committed', 'expense', 1),
+    ('Savings',   'savings', 2);
+
+-- Opening balance: edit this to today's actual balance/period before first use
+-- (PUT /settings from the app does the same thing later).
+INSERT INTO settings (opening_balance, opening_year, opening_month) VALUES
+    (0, EXTRACT(YEAR FROM CURRENT_DATE)::SMALLINT, EXTRACT(MONTH FROM CURRENT_DATE)::SMALLINT);
