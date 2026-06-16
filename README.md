@@ -1,6 +1,6 @@
 # cashflow-backend
 
-REST API for the cashflow forecast Android app, deployed on fimblefowl.co.uk
+REST API for the [cashflow Android app](https://github.com/quanglewangle/cashflow), deployed on fimblefowl.co.uk
 the same way as `qrzlook` and the shopping backend: a static Go binary run
 as a `systemctl --user` service, behind nginx.
 
