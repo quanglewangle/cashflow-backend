@@ -8,7 +8,7 @@
 --   psql cashflow -f schema.sql
 
 CREATE TYPE item_type AS ENUM ('income', 'expense', 'savings');
-CREATE TYPE item_frequency AS ENUM ('monthly', 'annual', 'irregular');
+CREATE TYPE item_frequency AS ENUM ('monthly', 'annual', 'irregular', 'four_weekly');
 CREATE TYPE entry_status AS ENUM ('planned', 'incurred');
 
 -- One row per physical credit card. statement_day/payment_due_day are
@@ -44,6 +44,7 @@ CREATE TABLE recurring_items (
     default_amount  NUMERIC(10,2),
     due_day         SMALLINT CHECK (due_day BETWEEN 1 AND 31),     -- monthly/annual items
     target_month    SMALLINT CHECK (target_month BETWEEN 1 AND 12), -- annual items only
+    anchor_date     DATE,                                          -- four_weekly items: date of a known occurrence
     credit_card_id  INT REFERENCES credit_cards(id),
     active          BOOLEAN NOT NULL DEFAULT TRUE,
     notes           TEXT
