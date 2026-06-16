@@ -28,3 +28,11 @@ INSERT INTO recurring_items (category_id, name, item_type, frequency, default_am
     (2, 'repay Marcus',         'expense', 'monthly', 500.00, NULL, NULL, TRUE),
     (2, 'Jack & Archie',        'expense', 'monthly',  60.00, NULL, NULL, TRUE),
     (2, 'Jenny''s card',        'expense', 'monthly', 500.00, 19, 3,    TRUE);
+
+-- From the sheet's "unusual payments" list: only "car" was confirmed as a
+-- genuine annual cost (it landed in the July column -> target_month=7).
+-- The rest (gudun, jenny's card lump payment, splashback, Trevor, vet,
+-- glasses) were one-offs and are deliberately not seeded as templates --
+-- add them ad-hoc from the app if/when they recur.
+INSERT INTO recurring_items (category_id, name, item_type, frequency, default_amount, target_month, active) VALUES
+    (2, 'car', 'expense', 'annual', 370.00, 7, TRUE);
