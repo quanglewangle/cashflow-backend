@@ -1,0 +1,7 @@
+# Add this location block inside the fimblefowl.co.uk server block in /etc/nginx/nginx.conf,
+# alongside the existing /qrz/ and /json blocks.
+
+             # cashflow
+             location /cashflow/ {
+               proxy_pass http://127.0.0.1:8092/;
+           }

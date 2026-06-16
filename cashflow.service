@@ -1,0 +1,17 @@
+[Unit]
+Description=Cashflow Forecast API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/peter
+ExecStart=/home/peter/cashflow
+Restart=on-failure
+RestartSec=5
+
+Environment=CASHFLOW_PORT=8092
+# Optional: require X-Write-Token header on mutating requests.
+# Environment=CASHFLOW_WRITE_TOKEN=changeme
+
+[Install]
+WantedBy=default.target
