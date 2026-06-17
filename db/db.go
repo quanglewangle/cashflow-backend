@@ -87,7 +87,7 @@ type RecurringItem struct {
 	DefaultAmount *float64   `json:"default_amount"`
 	DueDay        *int       `json:"due_day"`
 	TargetMonth   *int       `json:"target_month"`
-	AnchorDate    *time.Time `json:"anchor_date"` // four_weekly only: date of a known occurrence
+	AnchorDate    *string    `json:"anchor_date"` // ISO date "YYYY-MM-DD"; monthly: don't generate before this month; four_weekly: reference occurrence
 	CreditCardID  *int64     `json:"credit_card_id"`
 	Active        bool       `json:"active"`
 	Notes         *string    `json:"notes"`
@@ -425,7 +425,7 @@ func DeleteCardPurchase(id int64) error {
 func GetRecurringItems() ([]RecurringItem, error) {
 	rows, err := database.Query(`
 		SELECT id, category_id, name, item_type, frequency, default_amount,
-		       due_day, target_month, anchor_date, credit_card_id, active, notes
+		       due_day, target_month, anchor_date::text, credit_card_id, active, notes
 		FROM recurring_items ORDER BY name`)
 	if err != nil {
 		return nil, err
