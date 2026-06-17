@@ -586,19 +586,24 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 			amount = *t.defaultAmount
 		}
 
+		dueDay := t.dueDay
 		if t.frequency == "four_weekly" {
 			occurrences := fourWeeklyOccurrences(*t.anchorDate, year, month)
 			if occurrences == 0 {
 				continue // this cycle's 28-day drift means not every month gets one
 			}
 			amount *= float64(occurrences)
+			day := fourWeeklyFirstDay(*t.anchorDate, year, month)
+			if day > 0 {
+				dueDay = &day
+			}
 		}
 
 		res, err := database.Exec(`
 			INSERT INTO entries (recurring_item_id, category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id, due_day)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-			ON CONFLICT (recurring_item_id, period_year, period_month) DO NOTHING`,
-			t.id, t.categoryID, year, month, t.name, t.itemType, amount, t.creditCardID, t.dueDay,
+			ON CONFLICT (recurring_item_id, period_year, period_month) DO UPDATE SET due_day = EXCLUDED.due_day WHERE entries.due_day IS NULL`,
+			t.id, t.categoryID, year, month, t.name, t.itemType, amount, t.creditCardID, dueDay,
 		)
 		if err != nil {
 			return created, err
@@ -725,6 +730,33 @@ func fourWeeklyOccurrences(anchor time.Time, year, month int) int {
 		}
 	}
 	return count
+}
+
+// fourWeeklyFirstDay returns the day-of-month of the first four_weekly occurrence
+// in (year, month), or 0 if there is none.
+func fourWeeklyFirstDay(anchor time.Time, year, month int) int {
+	monthStart := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+	monthEnd := monthStart.AddDate(0, 1, 0)
+
+	diffDays := int(monthStart.Sub(anchor).Hours() / 24)
+	k := diffDays / 28
+	if diffDays%28 != 0 && diffDays > 0 {
+		k++
+	}
+	if k < 0 {
+		k = 0
+	}
+
+	for i := 0; i < 4; i++ {
+		occ := anchor.AddDate(0, 0, 28*(k+i))
+		if occ.Before(monthEnd) && !occ.Before(monthStart) {
+			return occ.Day()
+		}
+		if !occ.Before(monthEnd) {
+			break
+		}
+	}
+	return 0
 }
 
 // ---- Recurring card purchases (subscription templates) ----
