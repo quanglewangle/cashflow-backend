@@ -157,7 +157,7 @@ func AddCategory(c Category) (int64, error) {
 // ---- Credit cards ----
 
 func GetCreditCards() ([]CreditCard, error) {
-	rows, err := database.Query(`SELECT id, name, statement_day, payment_due_day, payment_due_month_offset FROM credit_cards ORDER BY name`)
+	rows, err := database.Query(`SELECT id, name, statement_day, payment_due_day, payment_due_month_offset FROM credit_cards ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -321,6 +321,27 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, count 
 		}
 	}
 	return total, count, nil
+}
+
+func GetCardPurchasesByMonth(year, month int) ([]CardPurchase, error) {
+	rows, err := database.Query(`
+		SELECT id, credit_card_id, description, amount, purchase_date, recurring_purchase_id
+		FROM card_purchases
+		WHERE EXTRACT(YEAR FROM purchase_date) = $1 AND EXTRACT(MONTH FROM purchase_date) = $2
+		ORDER BY purchase_date, id`, year, month)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CardPurchase
+	for rows.Next() {
+		var p CardPurchase
+		if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate, &p.RecurringPurchaseID); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
 }
 
 func GetCardPurchases(cardID int64) ([]CardPurchase, error) {
