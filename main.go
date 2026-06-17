@@ -19,7 +19,7 @@ import (
 )
 
 var writeToken string
-var buildHash = "dev"
+var buildHash = "dev-20260617"
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")

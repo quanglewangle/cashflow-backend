@@ -602,7 +602,7 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		res, err := database.Exec(`
 			INSERT INTO entries (recurring_item_id, category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id, due_day)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-			ON CONFLICT (recurring_item_id, period_year, period_month) DO UPDATE SET due_day = EXCLUDED.due_day WHERE entries.due_day IS NULL`,
+			ON CONFLICT (recurring_item_id, period_year, period_month) DO NOTHING`,
 			t.id, t.categoryID, year, month, t.name, t.itemType, amount, t.creditCardID, dueDay,
 		)
 		if err != nil {
@@ -610,6 +610,16 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		}
 		if n, _ := res.RowsAffected(); n > 0 {
 			created++
+		}
+		// Backfill due_day on existing entries that were generated without one.
+		if dueDay != nil {
+			if _, err := database.Exec(`
+				UPDATE entries SET due_day = $1
+				WHERE recurring_item_id = $2 AND period_year = $3 AND period_month = $4 AND due_day IS NULL`,
+				*dueDay, t.id, year, month,
+			); err != nil {
+				return created, err
+			}
 		}
 	}
 
