@@ -833,13 +833,28 @@ func latestCheckpointAtOrBefore(year, month int) (BalanceCheckpoint, bool, error
 // forecasting a month nobody has opened yet still reflects the templates,
 // instead of silently showing zero until someone visits it.
 func periodNet(year, month int) (income, expense, savings float64, err error) {
+	return periodNetFrom(year, month, 0)
+}
+
+// periodNetFrom is like periodNet but only counts entries with due_day >= fromDay
+// (entries with no due_day are always counted). Used to avoid double-counting
+// pre-checkpoint entries when the checkpoint falls within the month.
+func periodNetFrom(year, month, fromDay int) (income, expense, savings float64, err error) {
 	if _, err := GeneratePeriodEntries(year, month); err != nil {
 		return 0, 0, 0, err
 	}
 
-	rows, err := database.Query(`
-		SELECT item_type, COALESCE(actual_amount, planned_amount)
-		FROM entries WHERE period_year=$1 AND period_month=$2`, year, month)
+	var rows *sql.Rows
+	if fromDay <= 1 {
+		rows, err = database.Query(`
+			SELECT item_type, COALESCE(actual_amount, planned_amount)
+			FROM entries WHERE period_year=$1 AND period_month=$2`, year, month)
+	} else {
+		rows, err = database.Query(`
+			SELECT item_type, COALESCE(actual_amount, planned_amount)
+			FROM entries WHERE period_year=$1 AND period_month=$2
+			AND (due_day IS NULL OR due_day >= $3)`, year, month, fromDay)
+	}
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -888,7 +903,12 @@ func Forecast(year, month int) (ForecastSummary, error) {
 	balance := checkpoint.Balance
 	y, m := checkpoint.PeriodYear, checkpoint.PeriodMonth
 	for y < year || (y == year && m < month) {
-		inc, exp, sav, err := periodNet(y, m)
+		var inc, exp, sav float64
+		if y == checkpoint.PeriodYear && m == checkpoint.PeriodMonth {
+			inc, exp, sav, err = periodNetFrom(y, m, checkpoint.PeriodDay)
+		} else {
+			inc, exp, sav, err = periodNet(y, m)
+		}
 		if err != nil {
 			return ForecastSummary{}, err
 		}
@@ -896,9 +916,17 @@ func Forecast(year, month int) (ForecastSummary, error) {
 		y, m = nextPeriod(y, m)
 	}
 
+	// Display totals use the full month; carried-forward only counts post-checkpoint entries.
 	inc, exp, sav, err := periodNet(year, month)
 	if err != nil {
 		return ForecastSummary{}, err
+	}
+	cfInc, cfExp, cfSav := inc, exp, sav
+	if year == checkpoint.PeriodYear && month == checkpoint.PeriodMonth {
+		cfInc, cfExp, cfSav, err = periodNetFrom(year, month, checkpoint.PeriodDay)
+		if err != nil {
+			return ForecastSummary{}, err
+		}
 	}
 	return ForecastSummary{
 		PeriodYear:     year,
@@ -907,7 +935,7 @@ func Forecast(year, month int) (ForecastSummary, error) {
 		Income:         inc,
 		Expense:        exp,
 		Savings:        sav,
-		CarriedForward: balance + inc - exp - sav,
+		CarriedForward: balance + cfInc - cfExp - cfSav,
 	}, nil
 }
 
@@ -925,7 +953,12 @@ func ForecastRange(fromYear, fromMonth, count int) ([]ForecastSummary, error) {
 	balance := checkpoint.Balance
 	y, m := checkpoint.PeriodYear, checkpoint.PeriodMonth
 	for y < fromYear || (y == fromYear && m < fromMonth) {
-		inc, exp, sav, err := periodNet(y, m)
+		var inc, exp, sav float64
+		if y == checkpoint.PeriodYear && m == checkpoint.PeriodMonth {
+			inc, exp, sav, err = periodNetFrom(y, m, checkpoint.PeriodDay)
+		} else {
+			inc, exp, sav, err = periodNet(y, m)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -939,7 +972,14 @@ func ForecastRange(fromYear, fromMonth, count int) ([]ForecastSummary, error) {
 		if err != nil {
 			return nil, err
 		}
-		carried := balance + inc - exp - sav
+		cfInc, cfExp, cfSav := inc, exp, sav
+		if y == checkpoint.PeriodYear && m == checkpoint.PeriodMonth {
+			cfInc, cfExp, cfSav, err = periodNetFrom(y, m, checkpoint.PeriodDay)
+			if err != nil {
+				return nil, err
+			}
+		}
+		carried := balance + cfInc - cfExp - cfSav
 		out = append(out, ForecastSummary{
 			PeriodYear: y, PeriodMonth: m,
 			BroughtForward: balance, Income: inc, Expense: exp, Savings: sav,
