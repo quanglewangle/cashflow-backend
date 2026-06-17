@@ -468,6 +468,14 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 }
 
 func DeleteRecurringItem(id int64) error {
+	// Remove planned entries generated from this item; null out the FK on
+	// incurred ones so the historical record is kept but the item can be deleted.
+	if _, err := database.Exec(`DELETE FROM entries WHERE recurring_item_id=$1 AND status='planned'`, id); err != nil {
+		return err
+	}
+	if _, err := database.Exec(`UPDATE entries SET recurring_item_id=NULL WHERE recurring_item_id=$1`, id); err != nil {
+		return err
+	}
 	_, err := database.Exec(`DELETE FROM recurring_items WHERE id=$1`, id)
 	return err
 }
@@ -538,9 +546,14 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		SELECT id, category_id, name, item_type, frequency, default_amount, anchor_date, credit_card_id, due_day
 		FROM recurring_items
 		WHERE active = TRUE
-		  AND (frequency = 'monthly'
-		       OR (frequency = 'annual' AND target_month = $1)
-		       OR (frequency = 'four_weekly' AND anchor_date IS NOT NULL))`, month)
+		  AND (
+		    (frequency = 'monthly' AND (
+		      anchor_date IS NULL
+		      OR (EXTRACT(YEAR FROM anchor_date) * 12 + EXTRACT(MONTH FROM anchor_date)) <= ($2 * 12 + $1)
+		    ))
+		    OR (frequency = 'annual' AND target_month = $1)
+		    OR (frequency = 'four_weekly' AND anchor_date IS NOT NULL)
+		  )`, month, year)
 	if err != nil {
 		return 0, err
 	}
