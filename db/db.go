@@ -495,29 +495,33 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 		return err
 	}
 
-	// If the default amount changed on a card-linked item, recalculate every
-	// planned entry for this item.  recalculateCardEntry uses the new default
-	// for periods with no logged purchases and keeps the real purchase total
-	// for periods that have them — handling both cases correctly.  Entries
-	// with an actual_amount (already paid) are left untouched by that function.
-	if r.CreditCardID != nil && r.DefaultAmount != nil && oldAmount.Valid &&
-		*r.DefaultAmount != oldAmount.Float64 {
-		rows, err := database.Query(`
-			SELECT DISTINCT period_year, period_month FROM entries
-			WHERE recurring_item_id = $1 AND actual_amount IS NULL`, id)
-		if err == nil {
-			type period struct{ year, month int }
-			var periods []period
-			for rows.Next() {
-				var p period
-				if rows.Scan(&p.year, &p.month) == nil {
-					periods = append(periods, p)
+	if r.DefaultAmount != nil && oldAmount.Valid && *r.DefaultAmount != oldAmount.Float64 {
+		if r.CreditCardID != nil {
+			// Card-linked: recalculate each period so months with real purchases keep
+			// their purchase total and months with no purchases get the new default.
+			rows, err := database.Query(`
+				SELECT DISTINCT period_year, period_month FROM entries
+				WHERE recurring_item_id = $1 AND actual_amount IS NULL`, id)
+			if err == nil {
+				type period struct{ year, month int }
+				var periods []period
+				for rows.Next() {
+					var p period
+					if rows.Scan(&p.year, &p.month) == nil {
+						periods = append(periods, p)
+					}
+				}
+				rows.Close()
+				for _, p := range periods {
+					recalculateCardEntry(*r.CreditCardID, p.year, p.month)
 				}
 			}
-			rows.Close()
-			for _, p := range periods {
-				recalculateCardEntry(*r.CreditCardID, p.year, p.month)
-			}
+		} else {
+			// Non-card item: simply update all unpaid planned entries to the new amount.
+			database.Exec(`
+				UPDATE entries SET planned_amount = $1
+				WHERE recurring_item_id = $2 AND actual_amount IS NULL`,
+				*r.DefaultAmount, id)
 		}
 	}
 	return nil
