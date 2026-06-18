@@ -477,6 +477,12 @@ func AddRecurringItem(r RecurringItem) (int64, error) {
 }
 
 func UpdateRecurringItem(id int64, r RecurringItem) error {
+	// Read old default_amount so we can propagate a change to entries that still
+	// carry it as their planned_amount (i.e. the card entry has never had real
+	// purchases logged and is just showing the template estimate).
+	var oldAmount sql.NullFloat64
+	_ = database.QueryRow(`SELECT default_amount FROM recurring_items WHERE id=$1`, id).Scan(&oldAmount)
+
 	_, err := database.Exec(`
 		UPDATE recurring_items SET
 			category_id=$2, name=$3, item_type=$4, frequency=$5, default_amount=$6,
@@ -485,7 +491,36 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 		id, r.CategoryID, r.Name, r.ItemType, r.Frequency, r.DefaultAmount,
 		r.DueDay, r.TargetMonth, r.AnchorDate, r.CreditCardID, r.Active, r.Notes,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// If the default amount changed on a card-linked item, recalculate every
+	// planned entry for this item.  recalculateCardEntry uses the new default
+	// for periods with no logged purchases and keeps the real purchase total
+	// for periods that have them — handling both cases correctly.  Entries
+	// with an actual_amount (already paid) are left untouched by that function.
+	if r.CreditCardID != nil && r.DefaultAmount != nil && oldAmount.Valid &&
+		*r.DefaultAmount != oldAmount.Float64 {
+		rows, err := database.Query(`
+			SELECT DISTINCT period_year, period_month FROM entries
+			WHERE recurring_item_id = $1 AND actual_amount IS NULL`, id)
+		if err == nil {
+			type period struct{ year, month int }
+			var periods []period
+			for rows.Next() {
+				var p period
+				if rows.Scan(&p.year, &p.month) == nil {
+					periods = append(periods, p)
+				}
+			}
+			rows.Close()
+			for _, p := range periods {
+				recalculateCardEntry(*r.CreditCardID, p.year, p.month)
+			}
+		}
+	}
+	return nil
 }
 
 func DeleteRecurringItem(id int64) error {

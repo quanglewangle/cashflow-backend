@@ -163,9 +163,23 @@ func main() {
 	http.HandleFunc("/card-purchases", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
+			if year, okY := intQueryParam(r, "year"); okY {
+				month, okM := intQueryParam(r, "month")
+				if !okM {
+					writeError(w, http.StatusBadRequest, "month required with year")
+					return
+				}
+				purchases, err := db.GetCardPurchasesByMonth(year, month)
+				if err != nil {
+					writeError(w, http.StatusInternalServerError, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusOK, purchases)
+				return
+			}
 			cardID, ok := intQueryParam(r, "credit_card_id")
 			if !ok {
-				writeError(w, http.StatusBadRequest, "credit_card_id required")
+				writeError(w, http.StatusBadRequest, "credit_card_id or year+month required")
 				return
 			}
 			purchases, err := db.GetCardPurchases(int64(cardID))
@@ -284,6 +298,7 @@ func main() {
 				writeError(w, http.StatusBadRequest, "invalid JSON")
 				return
 			}
+			item.Active = true // always activate new subscriptions
 			id, err := db.AddRecurringCardPurchase(item)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
