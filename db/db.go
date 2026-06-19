@@ -500,6 +500,29 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 		database.Exec(`UPDATE entries SET due_day = $1 WHERE recurring_item_id = $2 AND actual_amount IS NULL`,
 			*r.DueDay, id)
 	}
+	// When frequency is changed to last_working_day, recalculate each unpaid entry's
+	// due_day to the correct last Mon-Fri for its own period.
+	if r.Frequency == "last_working_day" {
+		rows, err := database.Query(`
+			SELECT DISTINCT period_year, period_month FROM entries
+			WHERE recurring_item_id = $1 AND actual_amount IS NULL`, id)
+		if err == nil {
+			type period struct{ year, month int }
+			var periods []period
+			for rows.Next() {
+				var p period
+				if rows.Scan(&p.year, &p.month) == nil {
+					periods = append(periods, p)
+				}
+			}
+			rows.Close()
+			for _, p := range periods {
+				day := lastWorkingDayOfMonth(p.year, p.month)
+				database.Exec(`UPDATE entries SET due_day = $1 WHERE recurring_item_id = $2 AND period_year = $3 AND period_month = $4 AND actual_amount IS NULL`,
+					day, id, p.year, p.month)
+			}
+		}
+	}
 
 	if r.DefaultAmount != nil && oldAmount.Valid && *r.DefaultAmount != oldAmount.Float64 {
 		if r.CreditCardID != nil {
