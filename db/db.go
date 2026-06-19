@@ -495,6 +495,12 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 		return err
 	}
 
+	// Propagate due_day change to unpaid entries so their position matches the template.
+	if r.DueDay != nil {
+		database.Exec(`UPDATE entries SET due_day = $1 WHERE recurring_item_id = $2 AND actual_amount IS NULL`,
+			*r.DueDay, id)
+	}
+
 	if r.DefaultAmount != nil && oldAmount.Valid && *r.DefaultAmount != oldAmount.Float64 {
 		if r.CreditCardID != nil {
 			// Card-linked: recalculate each period so months with real purchases keep
