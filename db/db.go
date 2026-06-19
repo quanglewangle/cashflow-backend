@@ -617,6 +617,10 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		      anchor_date IS NULL
 		      OR (EXTRACT(YEAR FROM anchor_date) * 12 + EXTRACT(MONTH FROM anchor_date)) <= ($2 * 12 + $1)
 		    ))
+		    OR (frequency = 'last_working_day' AND (
+		      anchor_date IS NULL
+		      OR (EXTRACT(YEAR FROM anchor_date) * 12 + EXTRACT(MONTH FROM anchor_date)) <= ($2 * 12 + $1)
+		    ))
 		    OR (frequency = 'annual' AND target_month = $1)
 		    OR (frequency = 'four_weekly' AND anchor_date IS NOT NULL)
 		  )`, month, year)
@@ -653,6 +657,10 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		}
 
 		dueDay := t.dueDay
+		if t.frequency == "last_working_day" {
+			day := lastWorkingDayOfMonth(year, month)
+			dueDay = &day
+		}
 		if t.frequency == "four_weekly" {
 			occurrences := fourWeeklyOccurrences(*t.anchorDate, year, month)
 			if occurrences == 0 {
@@ -833,6 +841,15 @@ func fourWeeklyFirstDay(anchor time.Time, year, month int) int {
 		}
 	}
 	return 0
+}
+
+// lastWorkingDayOfMonth returns the last Monday-Friday of the given month.
+func lastWorkingDayOfMonth(year, month int) int {
+	last := time.Date(year, time.Month(month)+1, 0, 0, 0, 0, 0, time.UTC) // last day of month
+	for last.Weekday() == time.Saturday || last.Weekday() == time.Sunday {
+		last = last.AddDate(0, 0, -1)
+	}
+	return last.Day()
 }
 
 // ---- Recurring card purchases (subscription templates) ----
