@@ -1096,18 +1096,27 @@ type ForecastDanger struct {
 	CarriedForward float64 `json:"carried_forward"`
 }
 
-// periodMinBalance walks every entry in (year, month) in due_day order,
+// periodMinBalance walks entries in (year, month) with due_day >= fromDay,
 // starting from startBalance, and returns the minimum running balance reached
-// plus the day it first occurs. Entries with no due_day are treated as day 0
-// (i.e. counted first, before any dated entry) which is conservative.
-func periodMinBalance(year, month int, startBalance float64) (minBalance float64, minDay int, carried float64, err error) {
+// plus the day it first occurs. Pass fromDay=0 to include all entries.
+// Entries with no due_day are treated as day 0 (counted first).
+func periodMinBalance(year, month, fromDay int, startBalance float64) (minBalance float64, minDay int, carried float64, err error) {
 	if _, err = GeneratePeriodEntries(year, month); err != nil {
 		return
 	}
-	rows, err := database.Query(`
-		SELECT item_type, COALESCE(actual_amount, planned_amount), COALESCE(due_day, 0)
-		FROM entries WHERE period_year=$1 AND period_month=$2
-		ORDER BY COALESCE(due_day, 0)`, year, month)
+	var rows *sql.Rows
+	if fromDay <= 1 {
+		rows, err = database.Query(`
+			SELECT item_type, COALESCE(actual_amount, planned_amount), COALESCE(due_day, 0)
+			FROM entries WHERE period_year=$1 AND period_month=$2
+			ORDER BY COALESCE(due_day, 0)`, year, month)
+	} else {
+		rows, err = database.Query(`
+			SELECT item_type, COALESCE(actual_amount, planned_amount), COALESCE(due_day, 0)
+			FROM entries WHERE period_year=$1 AND period_month=$2
+			AND (due_day IS NULL OR due_day >= $3)
+			ORDER BY COALESCE(due_day, 0)`, year, month, fromDay)
+	}
 	if err != nil {
 		return
 	}
@@ -1167,7 +1176,16 @@ func ForecastDangerRange(fromYear, fromMonth, count int) ([]ForecastDanger, erro
 	out := make([]ForecastDanger, 0, count)
 	for i := 0; i < count; i++ {
 		bf := balance
-		minBal, minDay, carried, err := periodMinBalance(y, m, balance)
+		// For the checkpoint's own month, start from the checkpoint balance and
+		// only walk entries from the checkpoint day forward — past entries are
+		// already reflected in the checkpoint balance.
+		fromDay := 0
+		startBal := balance
+		if y == checkpoint.PeriodYear && m == checkpoint.PeriodMonth {
+			fromDay = checkpoint.PeriodDay
+			startBal = checkpoint.Balance
+		}
+		minBal, minDay, carried, err := periodMinBalance(y, m, fromDay, startBal)
 		if err != nil {
 			return nil, err
 		}
