@@ -1087,6 +1087,103 @@ func Forecast(year, month int) (ForecastSummary, error) {
 	}, nil
 }
 
+type ForecastDanger struct {
+	PeriodYear     int     `json:"period_year"`
+	PeriodMonth    int     `json:"period_month"`
+	BroughtForward float64 `json:"brought_forward"`
+	MinBalance     float64 `json:"min_balance"`      // lowest intra-month running balance
+	MinBalanceDay  int     `json:"min_balance_day"`  // day of month when minimum occurs
+	CarriedForward float64 `json:"carried_forward"`
+}
+
+// periodMinBalance walks every entry in (year, month) in due_day order,
+// starting from startBalance, and returns the minimum running balance reached
+// plus the day it first occurs. Entries with no due_day are treated as day 0
+// (i.e. counted first, before any dated entry) which is conservative.
+func periodMinBalance(year, month int, startBalance float64) (minBalance float64, minDay int, carried float64, err error) {
+	if _, err = GeneratePeriodEntries(year, month); err != nil {
+		return
+	}
+	rows, err := database.Query(`
+		SELECT item_type, COALESCE(actual_amount, planned_amount), COALESCE(due_day, 0)
+		FROM entries WHERE period_year=$1 AND period_month=$2
+		ORDER BY COALESCE(due_day, 0)`, year, month)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	balance := startBalance
+	minBalance = startBalance
+	minDay = 0
+	for rows.Next() {
+		var itemType string
+		var amount float64
+		var day int
+		if rows.Scan(&itemType, &amount, &day) != nil {
+			continue
+		}
+		if itemType == "income" {
+			balance += amount
+		} else {
+			balance -= amount
+		}
+		if balance < minBalance {
+			minBalance = balance
+			minDay = day
+		}
+	}
+	carried = balance
+	return
+}
+
+// ForecastDangerRange computes the intra-month minimum balance for each of
+// the next `count` months starting at (fromYear, fromMonth).
+func ForecastDangerRange(fromYear, fromMonth, count int) ([]ForecastDanger, error) {
+	checkpoint, found, err := latestCheckpointAtOrBefore(fromYear, fromMonth)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, errors.New("no balance checkpoint at or before this period -- add one via POST /checkpoints")
+	}
+
+	// Walk forward from the checkpoint to the start of the requested range.
+	balance := checkpoint.Balance
+	y, m := checkpoint.PeriodYear, checkpoint.PeriodMonth
+	for y < fromYear || (y == fromYear && m < fromMonth) {
+		var inc, exp, sav float64
+		if y == checkpoint.PeriodYear && m == checkpoint.PeriodMonth {
+			inc, exp, sav, err = periodNetFrom(y, m, checkpoint.PeriodDay)
+		} else {
+			inc, exp, sav, err = periodNet(y, m)
+		}
+		if err != nil {
+			return nil, err
+		}
+		balance += inc - exp - sav
+		y, m = nextPeriod(y, m)
+	}
+
+	out := make([]ForecastDanger, 0, count)
+	for i := 0; i < count; i++ {
+		bf := balance
+		minBal, minDay, carried, err := periodMinBalance(y, m, balance)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ForecastDanger{
+			PeriodYear: y, PeriodMonth: m,
+			BroughtForward: bf,
+			MinBalance:     minBal,
+			MinBalanceDay:  minDay,
+			CarriedForward: carried,
+		})
+		balance = carried
+		y, m = nextPeriod(y, m)
+	}
+	return out, nil
+}
+
 // ForecastRange computes consecutive period summaries from (fromYear,
 // fromMonth) for `count` months, in one forward pass.
 func ForecastRange(fromYear, fromMonth, count int) ([]ForecastSummary, error) {

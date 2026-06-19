@@ -544,6 +544,26 @@ func main() {
 		writeJSON(w, http.StatusOK, summaries)
 	})
 
+	http.HandleFunc("/forecast/danger", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		year, ok1 := intQueryParam(r, "year")
+		month, ok2 := intQueryParam(r, "month")
+		count, ok3 := intQueryParam(r, "count")
+		if !ok1 || !ok2 || !ok3 {
+			writeError(w, http.StatusBadRequest, "year, month and count required")
+			return
+		}
+		summaries, err := db.ForecastDangerRange(year, month, count)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, summaries)
+	})
+
 	// GET /checkpoints lists every known-good balance recorded so far.
 	// POST /checkpoints adds (or replaces, if the period already has one)
 	// a checkpoint -- e.g. after checking the real bank app -- which
