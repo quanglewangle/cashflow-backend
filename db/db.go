@@ -83,7 +83,7 @@ type RecurringItem struct {
 	CategoryID    int64      `json:"category_id"`
 	Name          string     `json:"name"`
 	ItemType      string     `json:"item_type"`
-	Frequency     string     `json:"frequency"` // monthly | annual | irregular | four_weekly
+	Frequency     string     `json:"frequency"` // monthly | three_monthly | annual | irregular | four_weekly
 	DefaultAmount *float64   `json:"default_amount"`
 	DueDay        *int       `json:"due_day"`
 	TargetMonth   *int       `json:"target_month"`
@@ -646,6 +646,7 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		    ))
 		    OR (frequency = 'annual' AND target_month = $1)
 		    OR (frequency = 'four_weekly' AND anchor_date IS NOT NULL)
+		    OR (frequency = 'three_monthly' AND anchor_date IS NOT NULL)
 		  )`, month, year)
 	if err != nil {
 		return 0, err
@@ -693,6 +694,11 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 			day := fourWeeklyFirstDay(*t.anchorDate, year, month)
 			if day > 0 {
 				dueDay = &day
+			}
+		}
+		if t.frequency == "three_monthly" {
+			if t.anchorDate == nil || !threeMonthlyFires(*t.anchorDate, year, month) {
+				continue
 			}
 		}
 
@@ -804,6 +810,14 @@ func generateRecurringCardPurchases(year, month int) (int, error) {
 
 func daysInMonth(year, month int) int {
 	return time.Date(year, time.Month(month)+1, 0, 0, 0, 0, 0, time.UTC).Day()
+}
+
+// threeMonthlyFires returns true when (year, month) is a multiple of 3 months
+// from the anchor date's year/month and is on or after it.
+func threeMonthlyFires(anchor time.Time, year, month int) bool {
+	ay, am := anchor.Year(), int(anchor.Month())
+	diff := (year*12 + month) - (ay*12 + am)
+	return diff >= 0 && diff%3 == 0
 }
 
 // fourWeeklyOccurrences counts how many anchor+28*k days (k=0,1,2,...) land
