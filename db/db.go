@@ -921,6 +921,54 @@ func DeleteRecurringCardPurchase(id int64) error {
 	return err
 }
 
+// ---- Card checkpoints ----
+
+type CardCheckpoint struct {
+	ID           int64   `json:"id"`
+	CreditCardID int64   `json:"credit_card_id"`
+	PeriodYear   int     `json:"period_year"`
+	PeriodMonth  int     `json:"period_month"`
+	PeriodDay    int     `json:"period_day"`
+	Balance      float64 `json:"balance"`
+}
+
+func GetCardCheckpoints(creditCardID int64) ([]CardCheckpoint, error) {
+	rows, err := database.Query(`
+		SELECT id, credit_card_id, period_year, period_month, period_day, balance
+		FROM card_checkpoints WHERE credit_card_id = $1
+		ORDER BY period_year, period_month, period_day`, creditCardID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CardCheckpoint
+	for rows.Next() {
+		var c CardCheckpoint
+		if err := rows.Scan(&c.ID, &c.CreditCardID, &c.PeriodYear, &c.PeriodMonth, &c.PeriodDay, &c.Balance); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+func AddCardCheckpoint(creditCardID int64, year, month, day int, balance float64) (int64, error) {
+	var id int64
+	err := database.QueryRow(`
+		INSERT INTO card_checkpoints (credit_card_id, period_year, period_month, period_day, balance)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (credit_card_id, period_year, period_month, period_day) DO UPDATE SET balance = $5
+		RETURNING id`,
+		creditCardID, year, month, day, balance,
+	).Scan(&id)
+	return id, err
+}
+
+func DeleteCardCheckpoint(id int64) error {
+	_, err := database.Exec(`DELETE FROM card_checkpoints WHERE id=$1`, id)
+	return err
+}
+
 // ---- Balance checkpoints ----
 
 func GetCheckpoints() ([]BalanceCheckpoint, error) {

@@ -564,6 +564,66 @@ func main() {
 		writeJSON(w, http.StatusOK, summaries)
 	})
 
+	// GET /card-checkpoints?credit_card_id=N lists checkpoints for a card.
+	// POST /card-checkpoints adds (or replaces) one.
+	// DELETE /card-checkpoints/{id} removes one.
+	http.HandleFunc("/card-checkpoints", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			cardID, ok := intQueryParam(r, "credit_card_id")
+			if !ok {
+				writeError(w, http.StatusBadRequest, "credit_card_id required")
+				return
+			}
+			checkpoints, err := db.GetCardCheckpoints(int64(cardID))
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, checkpoints)
+		case http.MethodPost:
+			if !okToWrite(w, r) {
+				return
+			}
+			var c db.CardCheckpoint
+			if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid JSON")
+				return
+			}
+			if c.PeriodDay == 0 {
+				c.PeriodDay = 1
+			}
+			id, err := db.AddCardCheckpoint(c.CreditCardID, c.PeriodYear, c.PeriodMonth, c.PeriodDay, c.Balance)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+
+	http.HandleFunc("/card-checkpoints/", func(w http.ResponseWriter, r *http.Request) {
+		id, err := idFromPath(r.URL.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !okToWrite(w, r) {
+			return
+		}
+		if err := db.DeleteCardCheckpoint(id); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	})
+
 	// GET /checkpoints lists every known-good balance recorded so far.
 	// POST /checkpoints adds (or replaces, if the period already has one)
 	// a checkpoint -- e.g. after checking the real bank app -- which
