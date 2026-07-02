@@ -1060,10 +1060,16 @@ func periodNetFrom(year, month, fromDay int) (income, expense, savings float64, 
 			SELECT item_type, COALESCE(actual_amount, planned_amount)
 			FROM entries WHERE period_year=$1 AND period_month=$2`, year, month)
 	} else {
+		// Exclude entries already incurred on the checkpoint day — they are baked
+		// into the checkpoint balance and must not be counted again.
 		rows, err = database.Query(`
 			SELECT item_type, COALESCE(actual_amount, planned_amount)
 			FROM entries WHERE period_year=$1 AND period_month=$2
-			AND (due_day IS NULL OR due_day >= $3)`, year, month, fromDay)
+			AND (
+				due_day IS NULL
+				OR due_day > $3
+				OR (due_day = $3 AND (status IS NULL OR status != 'incurred'))
+			)`, year, month, fromDay)
 	}
 	if err != nil {
 		return 0, 0, 0, err
