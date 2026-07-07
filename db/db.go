@@ -61,6 +61,7 @@ type CardPurchase struct {
 	Amount              float64   `json:"amount"`
 	PurchaseDate        time.Time `json:"purchase_date"`
 	RecurringPurchaseID *int64    `json:"recurring_purchase_id"`
+	CategoryID          *int64    `json:"category_id"`
 }
 
 // The template for a card subscription (Netflix, etc.) -- generates
@@ -325,7 +326,7 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, count 
 
 func GetCardPurchasesByMonth(year, month int) ([]CardPurchase, error) {
 	rows, err := database.Query(`
-		SELECT id, credit_card_id, description, amount, purchase_date, recurring_purchase_id
+		SELECT id, credit_card_id, description, amount, purchase_date, recurring_purchase_id, category_id
 		FROM card_purchases
 		WHERE EXTRACT(YEAR FROM purchase_date) = $1 AND EXTRACT(MONTH FROM purchase_date) = $2
 		ORDER BY purchase_date, id`, year, month)
@@ -336,7 +337,7 @@ func GetCardPurchasesByMonth(year, month int) ([]CardPurchase, error) {
 	var out []CardPurchase
 	for rows.Next() {
 		var p CardPurchase
-		if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate, &p.RecurringPurchaseID); err != nil {
+		if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate, &p.RecurringPurchaseID, &p.CategoryID); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -346,7 +347,7 @@ func GetCardPurchasesByMonth(year, month int) ([]CardPurchase, error) {
 
 func GetCardPurchases(cardID int64) ([]CardPurchase, error) {
 	rows, err := database.Query(`
-		SELECT id, credit_card_id, description, amount, purchase_date, recurring_purchase_id
+		SELECT id, credit_card_id, description, amount, purchase_date, recurring_purchase_id, category_id
 		FROM card_purchases WHERE credit_card_id = $1 ORDER BY purchase_date DESC, id DESC`, cardID)
 	if err != nil {
 		return nil, err
@@ -355,7 +356,7 @@ func GetCardPurchases(cardID int64) ([]CardPurchase, error) {
 	var out []CardPurchase
 	for rows.Next() {
 		var p CardPurchase
-		if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate, &p.RecurringPurchaseID); err != nil {
+		if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate, &p.RecurringPurchaseID, &p.CategoryID); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -366,9 +367,9 @@ func GetCardPurchases(cardID int64) ([]CardPurchase, error) {
 func AddCardPurchase(p CardPurchase) (int64, error) {
 	var id int64
 	err := database.QueryRow(`
-		INSERT INTO card_purchases (credit_card_id, description, amount, purchase_date, recurring_purchase_id)
-		VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-		p.CreditCardID, p.Description, p.Amount, p.PurchaseDate, p.RecurringPurchaseID,
+		INSERT INTO card_purchases (credit_card_id, description, amount, purchase_date, recurring_purchase_id, category_id)
+		VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		p.CreditCardID, p.Description, p.Amount, p.PurchaseDate, p.RecurringPurchaseID, p.CategoryID,
 	).Scan(&id)
 	if err != nil {
 		return 0, err
@@ -395,8 +396,8 @@ func UpdateCardPurchase(id int64, p CardPurchase) error {
 	}
 
 	if _, err := database.Exec(`
-		UPDATE card_purchases SET description=$2, amount=$3, purchase_date=$4 WHERE id=$1`,
-		id, p.Description, p.Amount, p.PurchaseDate,
+		UPDATE card_purchases SET description=$2, amount=$3, purchase_date=$4, category_id=$5 WHERE id=$1`,
+		id, p.Description, p.Amount, p.PurchaseDate, p.CategoryID,
 	); err != nil {
 		return err
 	}

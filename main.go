@@ -197,6 +197,7 @@ func main() {
 				Description  string  `json:"description"`
 				Amount       float64 `json:"amount"`
 				PurchaseDate string  `json:"purchase_date"`
+				CategoryID   *int64  `json:"category_id"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				writeError(w, http.StatusBadRequest, "invalid JSON")
@@ -212,6 +213,7 @@ func main() {
 				Description:  body.Description,
 				Amount:       body.Amount,
 				PurchaseDate: date,
+				CategoryID:   body.CategoryID,
 			})
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
@@ -238,6 +240,7 @@ func main() {
 				Description  string  `json:"description"`
 				Amount       float64 `json:"amount"`
 				PurchaseDate string  `json:"purchase_date"`
+				CategoryID   *int64  `json:"category_id"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				writeError(w, http.StatusBadRequest, "invalid JSON")
@@ -252,6 +255,7 @@ func main() {
 				Description:  body.Description,
 				Amount:       body.Amount,
 				PurchaseDate: date,
+				CategoryID:   body.CategoryID,
 			}); err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
