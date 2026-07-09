@@ -1027,6 +1027,10 @@ func GetCardCheckpoints(creditCardID int64) ([]CardCheckpoint, error) {
 	return out, nil
 }
 
+// AddCardCheckpoint records (or replaces) a checkpoint, then recalculates
+// whichever payment-period entry it now anchors -- otherwise the checkpoint
+// would sit unused until some unrelated purchase edit happened to trigger a
+// recalculation of that period.
 func AddCardCheckpoint(creditCardID int64, year, month, day int, balance float64) (int64, error) {
 	var id int64
 	err := database.QueryRow(`
@@ -1036,12 +1040,44 @@ func AddCardCheckpoint(creditCardID int64, year, month, day int, balance float64
 		RETURNING id`,
 		creditCardID, year, month, day, balance,
 	).Scan(&id)
-	return id, err
+	if err != nil {
+		return id, err
+	}
+	if err := recalculateCheckpointPeriod(creditCardID, year, month, day); err != nil {
+		return id, err
+	}
+	return id, nil
 }
 
+// DeleteCardCheckpoint removes a checkpoint, then recalculates the payment
+// period it used to anchor so that period falls back to summing its
+// purchases (or an earlier/no checkpoint) instead of keeping the stale total.
 func DeleteCardCheckpoint(id int64) error {
-	_, err := database.Exec(`DELETE FROM card_checkpoints WHERE id=$1`, id)
-	return err
+	var creditCardID int64
+	var year, month, day int
+	err := database.QueryRow(`
+		SELECT credit_card_id, period_year, period_month, period_day FROM card_checkpoints WHERE id=$1`, id,
+	).Scan(&creditCardID, &year, &month, &day)
+	if err != nil {
+		return err
+	}
+	if _, err := database.Exec(`DELETE FROM card_checkpoints WHERE id=$1`, id); err != nil {
+		return err
+	}
+	return recalculateCheckpointPeriod(creditCardID, year, month, day)
+}
+
+// recalculateCheckpointPeriod recalculates the payment-period entry that a
+// checkpoint dated (year, month, day) falls into, using the same
+// paymentPeriodFor rule applied to purchases.
+func recalculateCheckpointPeriod(creditCardID int64, year, month, day int) error {
+	card, err := getCreditCard(creditCardID)
+	if err != nil {
+		return err
+	}
+	checkpointDate := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+	py, pm := paymentPeriodFor(card, checkpointDate)
+	return recalculateCardEntry(creditCardID, py, pm)
 }
 
 // ---- Balance checkpoints ----
