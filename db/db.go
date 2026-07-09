@@ -280,11 +280,11 @@ func recalculateCardEntry(cardID int64, year, month int) error {
 
 	// Each purchase's payment period depends on paymentPeriodFor, which
 	// isn't expressible as plain SQL, so sum in Go rather than via SUM().
-	total, count, err := sumPurchasesForPeriod(cardID, year, month)
+	total, hasData, err := sumPurchasesForPeriod(cardID, year, month)
 	if err != nil {
 		return err
 	}
-	if count == 0 {
+	if !hasData {
 		total = item.defaultAmount
 	}
 
@@ -297,15 +297,35 @@ func recalculateCardEntry(cardID int64, year, month int) error {
 	return err
 }
 
-func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, count int, err error) {
+// sumPurchasesForPeriod totals this card's purchases whose payment period is
+// (year, month). If a card checkpoint's own date falls in that same payment
+// period (i.e. verifying/correcting the log partway through this statement
+// cycle), the latest such checkpoint's balance is used as the starting
+// point instead of the raw purchase log, and only purchases dated after it
+// are added on top -- otherwise purchases missed by logging (e.g. a Google
+// Pay tap that never got confirmed) would drift the repayment amount away
+// from the real balance forever, since the checkpoint was never consulted.
+func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasData bool, err error) {
 	card, err := getCreditCard(cardID)
 	if err != nil {
-		return 0, 0, err
+		return 0, false, err
 	}
+
+	checkpoint, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
+	if err != nil {
+		return 0, false, err
+	}
+	var afterDate time.Time
+	if hasCheckpoint {
+		total = checkpoint.Balance
+		hasData = true
+		afterDate = time.Date(checkpoint.PeriodYear, time.Month(checkpoint.PeriodMonth), checkpoint.PeriodDay, 0, 0, 0, 0, time.UTC)
+	}
+
 	rows, err := database.Query(`
 		SELECT amount, purchase_date FROM card_purchases WHERE credit_card_id = $1`, cardID)
 	if err != nil {
-		return 0, 0, err
+		return 0, false, err
 	}
 	defer rows.Close()
 
@@ -313,15 +333,50 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, count 
 		var amount float64
 		var purchaseDate time.Time
 		if err := rows.Scan(&amount, &purchaseDate); err != nil {
-			return 0, 0, err
+			return 0, false, err
 		}
 		py, pm := paymentPeriodFor(card, purchaseDate)
-		if py == year && pm == month {
-			total += amount
-			count++
+		if py != year || pm != month {
+			continue
+		}
+		if hasCheckpoint && !purchaseDate.After(afterDate) {
+			continue // already reflected in the checkpoint balance
+		}
+		total += amount
+		hasData = true
+	}
+	return total, hasData, nil
+}
+
+// latestCardCheckpointForPeriod finds the most recent checkpoint for this
+// card whose own date maps (via paymentPeriodFor, the same rule used for
+// purchases) to this same payment period -- i.e. it was taken partway
+// through the statement cycle that pays out in (year, month).
+func latestCardCheckpointForPeriod(card CreditCard, year, month int) (cp CardCheckpoint, found bool, err error) {
+	rows, err := database.Query(`
+		SELECT id, credit_card_id, period_year, period_month, period_day, balance
+		FROM card_checkpoints WHERE credit_card_id = $1`, card.ID)
+	if err != nil {
+		return CardCheckpoint{}, false, err
+	}
+	defer rows.Close()
+
+	var bestDate time.Time
+	for rows.Next() {
+		var c CardCheckpoint
+		if err := rows.Scan(&c.ID, &c.CreditCardID, &c.PeriodYear, &c.PeriodMonth, &c.PeriodDay, &c.Balance); err != nil {
+			return CardCheckpoint{}, false, err
+		}
+		cpDate := time.Date(c.PeriodYear, time.Month(c.PeriodMonth), c.PeriodDay, 0, 0, 0, 0, time.UTC)
+		py, pm := paymentPeriodFor(card, cpDate)
+		if py != year || pm != month {
+			continue
+		}
+		if !found || cpDate.After(bestDate) {
+			cp, found, bestDate = c, true, cpDate
 		}
 	}
-	return total, count, nil
+	return cp, found, nil
 }
 
 func GetCardPurchasesByMonth(year, month int) ([]CardPurchase, error) {
