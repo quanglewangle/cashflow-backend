@@ -556,6 +556,11 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 		database.Exec(`UPDATE entries SET due_day = $1 WHERE recurring_item_id = $2 AND actual_amount IS NULL`,
 			*r.DueDay, id)
 	}
+	// Propagate item_type change to unpaid entries so their income/expense sign
+	// matches the template -- otherwise an already-generated entry keeps whatever
+	// type it had at generation time forever, silently throwing off carried-forward.
+	database.Exec(`UPDATE entries SET item_type = $1 WHERE recurring_item_id = $2 AND actual_amount IS NULL`,
+		r.ItemType, id)
 	// When frequency is changed to last_working_day, recalculate each unpaid entry's
 	// due_day to the correct last Mon-Fri for its own period.
 	if r.Frequency == "last_working_day" {
