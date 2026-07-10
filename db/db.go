@@ -379,6 +379,62 @@ func latestCardCheckpointForPeriod(card CreditCard, year, month int) (cp CardChe
 	return cp, found, nil
 }
 
+// CardPaymentBreakdown explains how a card's payment-period entry total was
+// arrived at: the checkpoint it anchored to (if any) plus every purchase
+// added on top, in the same order sumPurchasesForPeriod would sum them.
+type CardPaymentBreakdown struct {
+	Checkpoint *CardCheckpoint `json:"checkpoint"`
+	Purchases  []CardPurchase  `json:"purchases"`
+	Total      float64         `json:"total"`
+}
+
+// GetCardPaymentBreakdown mirrors sumPurchasesForPeriod exactly, but returns
+// the checkpoint and purchase list behind the total instead of just the sum.
+func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdown, error) {
+	card, err := getCreditCard(cardID)
+	if err != nil {
+		return CardPaymentBreakdown{}, err
+	}
+
+	checkpoint, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
+	if err != nil {
+		return CardPaymentBreakdown{}, err
+	}
+	result := CardPaymentBreakdown{}
+	var afterDate time.Time
+	if hasCheckpoint {
+		cp := checkpoint
+		result.Checkpoint = &cp
+		result.Total = checkpoint.Balance
+		afterDate = time.Date(checkpoint.PeriodYear, time.Month(checkpoint.PeriodMonth), checkpoint.PeriodDay, 0, 0, 0, 0, time.UTC)
+	}
+
+	rows, err := database.Query(`
+		SELECT id, credit_card_id, description, amount, purchase_date, recurring_purchase_id, category_id
+		FROM card_purchases WHERE credit_card_id = $1 ORDER BY purchase_date, id`, cardID)
+	if err != nil {
+		return CardPaymentBreakdown{}, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var p CardPurchase
+		if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate, &p.RecurringPurchaseID, &p.CategoryID); err != nil {
+			return CardPaymentBreakdown{}, err
+		}
+		py, pm := paymentPeriodFor(card, p.PurchaseDate)
+		if py != year || pm != month {
+			continue
+		}
+		if hasCheckpoint && !p.PurchaseDate.After(afterDate) {
+			continue
+		}
+		result.Purchases = append(result.Purchases, p)
+		result.Total += p.Amount
+	}
+	return result, nil
+}
+
 func GetCardPurchasesByMonth(year, month int) ([]CardPurchase, error) {
 	rows, err := database.Query(`
 		SELECT id, credit_card_id, description, amount, purchase_date, recurring_purchase_id, category_id

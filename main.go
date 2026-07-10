@@ -628,6 +628,33 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 	})
 
+	// GET /card-payment-breakdown?credit_card_id=N&year=Y&month=M explains
+	// how that card's payment-period entry total was arrived at -- the
+	// checkpoint it anchored to (if any) and every purchase added on top.
+	http.HandleFunc("/card-payment-breakdown", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		cardID, ok := intQueryParam(r, "credit_card_id")
+		if !ok {
+			writeError(w, http.StatusBadRequest, "credit_card_id required")
+			return
+		}
+		year, ok1 := intQueryParam(r, "year")
+		month, ok2 := intQueryParam(r, "month")
+		if !ok1 || !ok2 {
+			writeError(w, http.StatusBadRequest, "year and month required")
+			return
+		}
+		breakdown, err := db.GetCardPaymentBreakdown(int64(cardID), year, month)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, breakdown)
+	})
+
 	// GET /checkpoints lists every known-good balance recorded so far.
 	// POST /checkpoints adds (or replaces, if the period already has one)
 	// a checkpoint -- e.g. after checking the real bank app -- which
