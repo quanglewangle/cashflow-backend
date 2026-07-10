@@ -1375,10 +1375,12 @@ type ForecastDanger struct {
 	CarriedForward float64 `json:"carried_forward"`
 }
 
-// periodMinBalance walks entries in (year, month) with due_day >= fromDay,
-// starting from startBalance, and returns the minimum running balance reached
-// plus the day it first occurs. Pass fromDay=0 to include all entries.
-// Entries with no due_day are treated as day 0 (counted first).
+// periodMinBalance walks entries in (year, month) from startBalance and
+// returns the minimum running balance reached plus the day it first occurs.
+// Pass fromDay=0 to include all entries. Entries with no due_day are treated
+// as day 0 (counted first). When fromDay is a checkpoint day, an entry due
+// exactly on it that's already incurred is skipped -- already reflected in
+// startBalance -- matching periodNetFrom.
 func periodMinBalance(year, month, fromDay int, startBalance float64) (minBalance float64, minDay int, carried float64, err error) {
 	if _, err = GeneratePeriodEntries(year, month); err != nil {
 		return
@@ -1390,10 +1392,17 @@ func periodMinBalance(year, month, fromDay int, startBalance float64) (minBalanc
 			FROM entries WHERE period_year=$1 AND period_month=$2
 			ORDER BY COALESCE(due_day, 0)`, year, month)
 	} else {
+		// Exclude entries already incurred on the checkpoint day — they are baked
+		// into startBalance (the checkpoint balance) and must not be counted again.
+		// Mirrors periodNetFrom's exclusion rule exactly.
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date, COALESCE(due_day, 0)
 			FROM entries WHERE period_year=$1 AND period_month=$2
-			AND (due_day IS NULL OR due_day >= $3)
+			AND (
+				due_day IS NULL
+				OR due_day > $3
+				OR (due_day = $3 AND (status IS NULL OR status != 'incurred'))
+			)
 			ORDER BY COALESCE(due_day, 0)`, year, month, fromDay)
 	}
 	if err != nil {
