@@ -1381,7 +1381,14 @@ type ForecastDanger struct {
 // as day 0 (counted first). When fromDay is a checkpoint day, an entry due
 // exactly on it that's already incurred is skipped -- already reflected in
 // startBalance -- matching periodNetFrom.
-func periodMinBalance(year, month, fromDay int, startBalance float64) (minBalance float64, minDay int, carried float64, err error) {
+//
+// trackMinFromDay (>= fromDay) lets the minimum-tracking window start later
+// than the summation itself -- e.g. "today", so a dip that already happened
+// and was survived doesn't get reported as still-upcoming danger. Every
+// entry from fromDay onward still gets summed either way, so carried (the
+// period's true closing balance, chained into next period's brought-forward)
+// is unaffected by where tracking starts.
+func periodMinBalance(year, month, fromDay, trackMinFromDay int, startBalance float64) (minBalance float64, minDay int, carried float64, err error) {
 	if _, err = GeneratePeriodEntries(year, month); err != nil {
 		return
 	}
@@ -1410,7 +1417,10 @@ func periodMinBalance(year, month, fromDay int, startBalance float64) (minBalanc
 	}
 	defer rows.Close()
 	balance := startBalance
-	minBalance = startBalance
+	tracking := trackMinFromDay <= fromDay
+	if tracking {
+		minBalance = startBalance
+	}
 	minDay = 0
 	for rows.Next() {
 		var itemType string
@@ -1428,10 +1438,20 @@ func periodMinBalance(year, month, fromDay int, startBalance float64) (minBalanc
 		} else {
 			balance -= amount
 		}
-		if balance < minBalance {
+		if !tracking && day >= trackMinFromDay {
+			tracking = true
 			minBalance = balance
 			minDay = day
 		}
+		if tracking && balance < minBalance {
+			minBalance = balance
+			minDay = day
+		}
+	}
+	if !tracking {
+		// Nothing left at/after trackMinFromDay -- balance won't dip further this period.
+		minBalance = balance
+		minDay = trackMinFromDay
 	}
 	carried = balance
 	return
@@ -1465,6 +1485,9 @@ func ForecastDangerRange(fromYear, fromMonth, count int) ([]ForecastDanger, erro
 		y, m = nextPeriod(y, m)
 	}
 
+	now := time.Now()
+	todayYear, todayMonth, todayDay := now.Year(), int(now.Month()), now.Day()
+
 	out := make([]ForecastDanger, 0, count)
 	for i := 0; i < count; i++ {
 		bf := balance
@@ -1477,7 +1500,13 @@ func ForecastDangerRange(fromYear, fromMonth, count int) ([]ForecastDanger, erro
 			fromDay = checkpoint.PeriodDay
 			startBal = checkpoint.Balance
 		}
-		minBal, minDay, carried, err := periodMinBalance(y, m, fromDay, startBal)
+		// For today's own month, don't report a dip that already happened and
+		// was survived -- only track the minimum from today onward.
+		trackMinFromDay := fromDay
+		if y == todayYear && m == todayMonth && todayDay > trackMinFromDay {
+			trackMinFromDay = todayDay
+		}
+		minBal, minDay, carried, err := periodMinBalance(y, m, fromDay, trackMinFromDay, startBal)
 		if err != nil {
 			return nil, err
 		}
