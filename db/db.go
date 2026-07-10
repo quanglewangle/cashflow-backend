@@ -380,12 +380,15 @@ func latestCardCheckpointForPeriod(card CreditCard, year, month int) (cp CardChe
 }
 
 // CardPaymentBreakdown explains how a card's payment-period entry total was
-// arrived at: the checkpoint it anchored to (if any) plus every purchase
-// added on top, in the same order sumPurchasesForPeriod would sum them.
+// arrived at: the checkpoint it anchored to (if any), every purchase already
+// folded into that checkpoint (informational -- doesn't add to Total), and
+// every purchase added on top (does add to Total), in the same order
+// sumPurchasesForPeriod would sum them.
 type CardPaymentBreakdown struct {
-	Checkpoint *CardCheckpoint `json:"checkpoint"`
-	Purchases  []CardPurchase  `json:"purchases"`
-	Total      float64         `json:"total"`
+	Checkpoint          *CardCheckpoint `json:"checkpoint"`
+	CoveredByCheckpoint []CardPurchase  `json:"covered_by_checkpoint"`
+	Purchases           []CardPurchase  `json:"purchases"`
+	Total               float64         `json:"total"`
 }
 
 // GetCardPaymentBreakdown mirrors sumPurchasesForPeriod exactly, but returns
@@ -427,6 +430,7 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 			continue
 		}
 		if hasCheckpoint && !p.PurchaseDate.After(afterDate) {
+			result.CoveredByCheckpoint = append(result.CoveredByCheckpoint, p)
 			continue
 		}
 		result.Purchases = append(result.Purchases, p)
