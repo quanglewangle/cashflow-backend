@@ -762,6 +762,19 @@ func AddEntry(e Entry) (int64, error) {
 }
 
 func UpdateEntry(id int64, e Entry) error {
+	// If decay is being turned on (or the client omitted the field while it's
+	// already running) without a start date, don't silently disable decay --
+	// fall back to whatever's already stored, or today if this is genuinely new.
+	if e.DecayPerWeek != nil && e.DecayStartDate == nil {
+		var existing *time.Time
+		_ = database.QueryRow(`SELECT decay_start_date FROM entries WHERE id=$1`, id).Scan(&existing)
+		if existing != nil {
+			e.DecayStartDate = existing
+		} else {
+			today := time.Now().Truncate(24 * time.Hour)
+			e.DecayStartDate = &today
+		}
+	}
 	_, err := database.Exec(`
 		UPDATE entries SET
 			category_id=$2, name=$3, item_type=$4, planned_amount=$5,
