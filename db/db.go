@@ -95,18 +95,46 @@ type RecurringItem struct {
 }
 
 type Entry struct {
-	ID              int64    `json:"id"`
-	RecurringItemID *int64   `json:"recurring_item_id"`
-	CategoryID      int64    `json:"category_id"`
-	PeriodYear      int      `json:"period_year"`
-	PeriodMonth     int      `json:"period_month"`
-	Name            string   `json:"name"`
-	ItemType        string   `json:"item_type"`
-	PlannedAmount   float64  `json:"planned_amount"`
-	ActualAmount    *float64 `json:"actual_amount"`
-	Status          string   `json:"status"` // planned | incurred
-	CreditCardID    *int64   `json:"credit_card_id"`
-	DueDay          *int     `json:"due_day"`
+	ID              int64      `json:"id"`
+	RecurringItemID *int64     `json:"recurring_item_id"`
+	CategoryID      int64      `json:"category_id"`
+	PeriodYear      int        `json:"period_year"`
+	PeriodMonth     int        `json:"period_month"`
+	Name            string     `json:"name"`
+	ItemType        string     `json:"item_type"`
+	PlannedAmount   float64    `json:"planned_amount"`
+	ActualAmount    *float64   `json:"actual_amount"`
+	Status          string     `json:"status"` // planned | incurred
+	CreditCardID    *int64     `json:"credit_card_id"`
+	DueDay          *int       `json:"due_day"`
+	DecayPerWeek    *float64   `json:"decay_per_week"`
+	DecayStartDate  *time.Time `json:"decay_start_date"`
+	// EffectiveAmount is PlannedAmount with any decay applied as of now --
+	// computed at read time, never stored. Client display/balance math
+	// should prefer this over PlannedAmount; edit dialogs should still
+	// show PlannedAmount, the undecayed original.
+	EffectiveAmount float64 `json:"effective_amount"`
+}
+
+// effectiveEntryAmount applies decay_per_week's weekly reduction to
+// planned_amount, floored at zero, as of now -- frozen once actual_amount
+// is set (a confirmed real amount is never an estimate to decay).
+func effectiveEntryAmount(plannedAmount float64, actualAmount *float64, decayPerWeek *float64, decayStartDate *time.Time) float64 {
+	if actualAmount != nil {
+		return *actualAmount
+	}
+	if decayPerWeek == nil || decayStartDate == nil {
+		return plannedAmount
+	}
+	weeksElapsed := int(time.Since(*decayStartDate).Hours() / 24 / 7)
+	if weeksElapsed < 0 {
+		weeksElapsed = 0
+	}
+	amount := plannedAmount - *decayPerWeek*float64(weeksElapsed)
+	if amount < 0 {
+		amount = 0
+	}
+	return amount
 }
 
 type BalanceCheckpoint struct {
@@ -695,7 +723,8 @@ func DeleteRecurringItem(id int64) error {
 func GetEntries(year, month int) ([]Entry, error) {
 	rows, err := database.Query(`
 		SELECT id, recurring_item_id, category_id, period_year, period_month,
-		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day
+		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day,
+		       decay_per_week, decay_start_date
 		FROM entries WHERE period_year=$1 AND period_month=$2 ORDER BY due_day NULLS LAST, id`, year, month)
 	if err != nil {
 		return nil, err
@@ -705,23 +734,29 @@ func GetEntries(year, month int) ([]Entry, error) {
 	for rows.Next() {
 		var e Entry
 		if err := rows.Scan(&e.ID, &e.RecurringItemID, &e.CategoryID, &e.PeriodYear, &e.PeriodMonth,
-			&e.Name, &e.ItemType, &e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID, &e.DueDay); err != nil {
+			&e.Name, &e.ItemType, &e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID, &e.DueDay,
+			&e.DecayPerWeek, &e.DecayStartDate); err != nil {
 			return nil, err
 		}
+		e.EffectiveAmount = effectiveEntryAmount(e.PlannedAmount, e.ActualAmount, e.DecayPerWeek, e.DecayStartDate)
 		out = append(out, e)
 	}
 	return out, nil
 }
 
 func AddEntry(e Entry) (int64, error) {
+	if e.DecayPerWeek != nil && e.DecayStartDate == nil {
+		today := time.Now().Truncate(24 * time.Hour)
+		e.DecayStartDate = &today
+	}
 	var id int64
 	err := database.QueryRow(`
 		INSERT INTO entries
 			(recurring_item_id, category_id, period_year, period_month, name, item_type,
-			 planned_amount, actual_amount, status, credit_card_id, due_day)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+			 planned_amount, actual_amount, status, credit_card_id, due_day, decay_per_week, decay_start_date)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
 		e.RecurringItemID, e.CategoryID, e.PeriodYear, e.PeriodMonth, e.Name, e.ItemType,
-		e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID, e.DueDay,
+		e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID, e.DueDay, e.DecayPerWeek, e.DecayStartDate,
 	).Scan(&id)
 	return id, err
 }
@@ -730,9 +765,11 @@ func UpdateEntry(id int64, e Entry) error {
 	_, err := database.Exec(`
 		UPDATE entries SET
 			category_id=$2, name=$3, item_type=$4, planned_amount=$5,
-			actual_amount=$6, status=$7, credit_card_id=$8, due_day=$9
+			actual_amount=$6, status=$7, credit_card_id=$8, due_day=$9,
+			decay_per_week=$10, decay_start_date=$11
 		WHERE id=$1`,
 		id, e.CategoryID, e.Name, e.ItemType, e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID, e.DueDay,
+		e.DecayPerWeek, e.DecayStartDate,
 	)
 	return err
 }
@@ -1214,13 +1251,13 @@ func periodNetFrom(year, month, fromDay int) (income, expense, savings float64, 
 	var rows *sql.Rows
 	if fromDay <= 1 {
 		rows, err = database.Query(`
-			SELECT item_type, COALESCE(actual_amount, planned_amount)
+			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date
 			FROM entries WHERE period_year=$1 AND period_month=$2`, year, month)
 	} else {
 		// Exclude entries already incurred on the checkpoint day — they are baked
 		// into the checkpoint balance and must not be counted again.
 		rows, err = database.Query(`
-			SELECT item_type, COALESCE(actual_amount, planned_amount)
+			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date
 			FROM entries WHERE period_year=$1 AND period_month=$2
 			AND (
 				due_day IS NULL
@@ -1234,10 +1271,14 @@ func periodNetFrom(year, month, fromDay int) (income, expense, savings float64, 
 	defer rows.Close()
 	for rows.Next() {
 		var itemType string
-		var amount float64
-		if err := rows.Scan(&itemType, &amount); err != nil {
+		var plannedAmount float64
+		var actualAmount *float64
+		var decayPerWeek *float64
+		var decayStartDate *time.Time
+		if err := rows.Scan(&itemType, &plannedAmount, &actualAmount, &decayPerWeek, &decayStartDate); err != nil {
 			return 0, 0, 0, err
 		}
+		amount := effectiveEntryAmount(plannedAmount, actualAmount, decayPerWeek, decayStartDate)
 		switch itemType {
 		case "income":
 			income += amount
@@ -1332,12 +1373,12 @@ func periodMinBalance(year, month, fromDay int, startBalance float64) (minBalanc
 	var rows *sql.Rows
 	if fromDay <= 1 {
 		rows, err = database.Query(`
-			SELECT item_type, COALESCE(actual_amount, planned_amount), COALESCE(due_day, 0)
+			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date, COALESCE(due_day, 0)
 			FROM entries WHERE period_year=$1 AND period_month=$2
 			ORDER BY COALESCE(due_day, 0)`, year, month)
 	} else {
 		rows, err = database.Query(`
-			SELECT item_type, COALESCE(actual_amount, planned_amount), COALESCE(due_day, 0)
+			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date, COALESCE(due_day, 0)
 			FROM entries WHERE period_year=$1 AND period_month=$2
 			AND (due_day IS NULL OR due_day >= $3)
 			ORDER BY COALESCE(due_day, 0)`, year, month, fromDay)
@@ -1351,11 +1392,15 @@ func periodMinBalance(year, month, fromDay int, startBalance float64) (minBalanc
 	minDay = 0
 	for rows.Next() {
 		var itemType string
-		var amount float64
+		var plannedAmount float64
+		var actualAmount *float64
+		var decayPerWeek *float64
+		var decayStartDate *time.Time
 		var day int
-		if rows.Scan(&itemType, &amount, &day) != nil {
+		if rows.Scan(&itemType, &plannedAmount, &actualAmount, &decayPerWeek, &decayStartDate, &day) != nil {
 			continue
 		}
+		amount := effectiveEntryAmount(plannedAmount, actualAmount, decayPerWeek, decayStartDate)
 		if itemType == "income" {
 			balance += amount
 		} else {
