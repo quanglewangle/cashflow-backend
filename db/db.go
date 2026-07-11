@@ -373,6 +373,39 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 		total += amount
 		hasData = true
 	}
+
+	// One-off entries deliberately tagged with this card (e.g. a decaying
+	// "sundries" contingency for anticipated-but-not-yet-logged spending) --
+	// added on top for the payment period the user gave them directly, no
+	// paymentPeriodFor translation needed since they're not dated purchases.
+	// periodNet/periodNetFrom exclude these from the general forecast so they
+	// aren't also counted as an independent line -- they're folded in here.
+	oneOffRows, err := database.Query(`
+		SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date
+		FROM entries WHERE credit_card_id = $1 AND recurring_item_id IS NULL
+		AND period_year = $2 AND period_month = $3`, cardID, year, month)
+	if err != nil {
+		return 0, false, err
+	}
+	defer oneOffRows.Close()
+
+	for oneOffRows.Next() {
+		var itemType string
+		var plannedAmount float64
+		var actualAmount *float64
+		var decayPerWeek *float64
+		var decayStartDate *time.Time
+		if err := oneOffRows.Scan(&itemType, &plannedAmount, &actualAmount, &decayPerWeek, &decayStartDate); err != nil {
+			return 0, false, err
+		}
+		amount := effectiveEntryAmount(plannedAmount, actualAmount, decayPerWeek, decayStartDate)
+		if itemType == "income" {
+			total -= amount
+		} else {
+			total += amount
+		}
+		hasData = true
+	}
 	return total, hasData, nil
 }
 
@@ -758,7 +791,15 @@ func AddEntry(e Entry) (int64, error) {
 		e.RecurringItemID, e.CategoryID, e.PeriodYear, e.PeriodMonth, e.Name, e.ItemType,
 		e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID, e.DueDay, e.DecayPerWeek, e.DecayStartDate,
 	).Scan(&id)
-	return id, err
+	if err != nil {
+		return id, err
+	}
+	if e.RecurringItemID == nil && e.CreditCardID != nil {
+		if err := recalculateCardEntry(*e.CreditCardID, e.PeriodYear, e.PeriodMonth); err != nil {
+			return id, err
+		}
+	}
+	return id, nil
 }
 
 func UpdateEntry(id int64, e Entry) error {
@@ -775,6 +816,13 @@ func UpdateEntry(id int64, e Entry) error {
 			e.DecayStartDate = &today
 		}
 	}
+
+	var oldRecurringItemID *int64
+	var oldCreditCardID *int64
+	var periodYear, periodMonth int
+	_ = database.QueryRow(`SELECT recurring_item_id, credit_card_id, period_year, period_month FROM entries WHERE id=$1`, id).
+		Scan(&oldRecurringItemID, &oldCreditCardID, &periodYear, &periodMonth)
+
 	_, err := database.Exec(`
 		UPDATE entries SET
 			category_id=$2, name=$3, item_type=$4, planned_amount=$5,
@@ -784,12 +832,41 @@ func UpdateEntry(id int64, e Entry) error {
 		id, e.CategoryID, e.Name, e.ItemType, e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID, e.DueDay,
 		e.DecayPerWeek, e.DecayStartDate,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// One-off entries tagged with a card feed into that card's own repayment
+	// entry (see sumPurchasesForPeriod) -- recalculate whichever card(s) this
+	// edit affects, old and new, in case the tag was added, removed, or changed.
+	if oldRecurringItemID == nil && oldCreditCardID != nil {
+		if err := recalculateCardEntry(*oldCreditCardID, periodYear, periodMonth); err != nil {
+			return err
+		}
+	}
+	if e.RecurringItemID == nil && e.CreditCardID != nil && (oldCreditCardID == nil || *oldCreditCardID != *e.CreditCardID) {
+		if err := recalculateCardEntry(*e.CreditCardID, periodYear, periodMonth); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func DeleteEntry(id int64) error {
+	var recurringItemID *int64
+	var creditCardID *int64
+	var periodYear, periodMonth int
+	_ = database.QueryRow(`SELECT recurring_item_id, credit_card_id, period_year, period_month FROM entries WHERE id=$1`, id).
+		Scan(&recurringItemID, &creditCardID, &periodYear, &periodMonth)
+
 	_, err := database.Exec(`DELETE FROM entries WHERE id=$1`, id)
-	return err
+	if err != nil {
+		return err
+	}
+	if recurringItemID == nil && creditCardID != nil {
+		return recalculateCardEntry(*creditCardID, periodYear, periodMonth)
+	}
+	return nil
 }
 
 // GeneratePeriodEntries creates entries for (year, month) from active
@@ -1261,17 +1338,23 @@ func periodNetFrom(year, month, fromDay int) (income, expense, savings float64, 
 		return 0, 0, 0, err
 	}
 
+	// One-off entries tagged with a credit card (recurring_item_id IS NULL,
+	// credit_card_id set) are folded into that card's own repayment entry by
+	// sumPurchasesForPeriod instead -- excluded here so they aren't also
+	// counted as an independent line.
 	var rows *sql.Rows
 	if fromDay <= 1 {
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date
-			FROM entries WHERE period_year=$1 AND period_month=$2`, year, month)
+			FROM entries WHERE period_year=$1 AND period_month=$2
+			AND (credit_card_id IS NULL OR recurring_item_id IS NOT NULL)`, year, month)
 	} else {
 		// Exclude entries already incurred on the checkpoint day — they are baked
 		// into the checkpoint balance and must not be counted again.
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date
 			FROM entries WHERE period_year=$1 AND period_month=$2
+			AND (credit_card_id IS NULL OR recurring_item_id IS NOT NULL)
 			AND (
 				due_day IS NULL
 				OR due_day > $3
@@ -1392,11 +1475,15 @@ func periodMinBalance(year, month, fromDay, trackMinFromDay int, startBalance fl
 	if _, err = GeneratePeriodEntries(year, month); err != nil {
 		return
 	}
+	// One-off entries tagged with a credit card are folded into that card's
+	// own repayment entry by sumPurchasesForPeriod instead -- excluded here,
+	// same as periodNetFrom.
 	var rows *sql.Rows
 	if fromDay <= 1 {
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date, COALESCE(due_day, 0)
 			FROM entries WHERE period_year=$1 AND period_month=$2
+			AND (credit_card_id IS NULL OR recurring_item_id IS NOT NULL)
 			ORDER BY COALESCE(due_day, 0)`, year, month)
 	} else {
 		// Exclude entries already incurred on the checkpoint day — they are baked
@@ -1405,6 +1492,7 @@ func periodMinBalance(year, month, fromDay, trackMinFromDay int, startBalance fl
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date, COALESCE(due_day, 0)
 			FROM entries WHERE period_year=$1 AND period_month=$2
+			AND (credit_card_id IS NULL OR recurring_item_id IS NOT NULL)
 			AND (
 				due_day IS NULL
 				OR due_day > $3
