@@ -622,12 +622,15 @@ func main() {
 			if c.PeriodDay == 0 {
 				c.PeriodDay = 1
 			}
-			id, err := db.AddCardCheckpoint(c.CreditCardID, c.PeriodYear, c.PeriodMonth, c.PeriodDay, c.Balance)
+			id, existingOneOffs, err := db.AddCardCheckpoint(c.CreditCardID, c.PeriodYear, c.PeriodMonth, c.PeriodDay, c.Balance)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+			writeJSON(w, http.StatusCreated, map[string]interface{}{
+				"id":                id,
+				"existing_one_offs": existingOneOffs,
+			})
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}

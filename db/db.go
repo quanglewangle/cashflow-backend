@@ -1344,7 +1344,13 @@ func GetCardCheckpoints(creditCardID int64) ([]CardCheckpoint, error) {
 // whichever payment-period entry it now anchors -- otherwise the checkpoint
 // would sit unused until some unrelated purchase edit happened to trigger a
 // recalculation of that period.
-func AddCardCheckpoint(creditCardID int64, year, month, day int, balance float64) (int64, error) {
+// AddCardCheckpoint records (or replaces) a checkpoint, recalculates the
+// payment period it now anchors, and also returns any card-tagged one-off
+// entries (e.g. a decaying sundries buffer) already sitting in that same
+// period -- likely redundant now that a fresh, verified balance covers it,
+// so the caller can offer to remove them instead of them being silently
+// forgotten and double-counted (this has bitten the user twice already).
+func AddCardCheckpoint(creditCardID int64, year, month, day int, balance float64) (int64, []Entry, error) {
 	var id int64
 	err := database.QueryRow(`
 		INSERT INTO card_checkpoints (credit_card_id, period_year, period_month, period_day, balance)
@@ -1354,12 +1360,51 @@ func AddCardCheckpoint(creditCardID int64, year, month, day int, balance float64
 		creditCardID, year, month, day, balance,
 	).Scan(&id)
 	if err != nil {
-		return id, err
+		return id, nil, err
 	}
 	if err := recalculateCheckpointPeriod(creditCardID, year, month, day); err != nil {
-		return id, err
+		return id, nil, err
 	}
-	return id, nil
+
+	card, err := getCreditCard(creditCardID)
+	if err != nil {
+		return id, nil, err
+	}
+	checkpointDate := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+	py, pm := paymentPeriodFor(card, checkpointDate)
+	oneOffs, err := GetCardTaggedOneOffs(creditCardID, py, pm)
+	if err != nil {
+		return id, nil, err
+	}
+	return id, oneOffs, nil
+}
+
+// GetCardTaggedOneOffs returns one-off entries (recurring_item_id IS NULL)
+// tagged with this card for the given payment period.
+func GetCardTaggedOneOffs(cardID int64, year, month int) ([]Entry, error) {
+	rows, err := database.Query(`
+		SELECT id, recurring_item_id, category_id, period_year, period_month,
+		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day,
+		       decay_per_week, decay_start_date
+		FROM entries WHERE credit_card_id = $1 AND recurring_item_id IS NULL
+		AND period_year = $2 AND period_month = $3
+		ORDER BY due_day NULLS LAST, id`, cardID, year, month)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Entry
+	for rows.Next() {
+		var e Entry
+		if err := rows.Scan(&e.ID, &e.RecurringItemID, &e.CategoryID, &e.PeriodYear, &e.PeriodMonth,
+			&e.Name, &e.ItemType, &e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID, &e.DueDay,
+			&e.DecayPerWeek, &e.DecayStartDate); err != nil {
+			return nil, err
+		}
+		e.EffectiveAmount = effectiveEntryAmount(e.PlannedAmount, e.ActualAmount, e.DecayPerWeek, e.DecayStartDate)
+		out = append(out, e)
+	}
+	return out, nil
 }
 
 // DeleteCardCheckpoint removes a checkpoint, then recalculates the payment
