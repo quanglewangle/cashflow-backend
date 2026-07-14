@@ -102,6 +102,31 @@ func main() {
 		}
 	})
 
+	http.HandleFunc("/categories/", func(w http.ResponseWriter, r *http.Request) {
+		id, err := idFromPath(r.URL.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		if r.Method != http.MethodPut {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !okToWrite(w, r) {
+			return
+		}
+		var c db.Category
+		if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+		if err := db.UpdateCategory(id, c); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+	})
+
 	http.HandleFunc("/credit-cards", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:

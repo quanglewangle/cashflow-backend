@@ -44,6 +44,7 @@ type Category struct {
 	Name      string `json:"name"`
 	ItemType  string `json:"item_type"` // income | expense | savings
 	SortOrder int    `json:"sort_order"`
+	ParentID  *int64 `json:"parent_id"` // null = top-level
 }
 
 type CreditCard struct {
@@ -158,7 +159,7 @@ type ForecastSummary struct {
 // ---- Categories ----
 
 func GetCategories() ([]Category, error) {
-	rows, err := database.Query(`SELECT id, name, item_type, sort_order FROM categories ORDER BY sort_order, name`)
+	rows, err := database.Query(`SELECT id, name, item_type, sort_order, parent_id FROM categories ORDER BY sort_order, name`)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +167,7 @@ func GetCategories() ([]Category, error) {
 	var out []Category
 	for rows.Next() {
 		var c Category
-		if err := rows.Scan(&c.ID, &c.Name, &c.ItemType, &c.SortOrder); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.ItemType, &c.SortOrder, &c.ParentID); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -177,10 +178,18 @@ func GetCategories() ([]Category, error) {
 func AddCategory(c Category) (int64, error) {
 	var id int64
 	err := database.QueryRow(
-		`INSERT INTO categories (name, item_type, sort_order) VALUES ($1, $2, $3) RETURNING id`,
-		c.Name, c.ItemType, c.SortOrder,
+		`INSERT INTO categories (name, item_type, sort_order, parent_id) VALUES ($1, $2, $3, $4) RETURNING id`,
+		c.Name, c.ItemType, c.SortOrder, c.ParentID,
 	).Scan(&id)
 	return id, err
+}
+
+func UpdateCategory(id int64, c Category) error {
+	_, err := database.Exec(
+		`UPDATE categories SET name=$2, item_type=$3, sort_order=$4, parent_id=$5 WHERE id=$1`,
+		id, c.Name, c.ItemType, c.SortOrder, c.ParentID,
+	)
+	return err
 }
 
 // ---- Credit cards ----
