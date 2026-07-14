@@ -357,6 +357,17 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 		total = checkpoint.Balance
 		hasData = true
 		afterDate = time.Date(checkpoint.PeriodYear, time.Month(checkpoint.PeriodMonth), checkpoint.PeriodDay, 0, 0, 0, 0, time.UTC)
+
+		// A checkpoint is a snapshot of everything posted to the card up to that
+		// date, including any earlier statement's bill that hasn't been paid off
+		// yet -- that amount is already baked into checkpoint.Balance, but it's
+		// also counted on its own as that earlier period's entry, so leaving it
+		// in here would double it. Net it back out.
+		unpaidPrior, err := sumUnpaidPriorCardBills(cardID, year, month)
+		if err != nil {
+			return 0, false, err
+		}
+		total -= unpaidPrior
 	}
 
 	rows, err := database.Query(`
@@ -416,6 +427,43 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 		hasData = true
 	}
 	return total, hasData, nil
+}
+
+// sumUnpaidPriorCardBills totals this card's own repayment entries for every
+// payment period strictly before (year, month) that aren't marked incurred
+// yet -- amounts a checkpoint dated after those periods closed would already
+// include in its running balance, but that are still due to be settled on
+// their own as that earlier period's entry. Returns 0 if the card has no
+// dedicated repayment recurring item (e.g. Barclaycard, paid down by a fixed
+// amount rather than in full each cycle -- see recurringItemForCard).
+func sumUnpaidPriorCardBills(cardID int64, year, month int) (float64, error) {
+	item, found, err := recurringItemForCard(cardID)
+	if err != nil || !found {
+		return 0, err
+	}
+	rows, err := database.Query(`
+		SELECT planned_amount, actual_amount, decay_per_week, decay_start_date
+		FROM entries
+		WHERE recurring_item_id = $1 AND status != 'incurred'
+		AND (period_year < $2 OR (period_year = $2 AND period_month < $3))`,
+		item.id, year, month)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	var total float64
+	for rows.Next() {
+		var plannedAmount float64
+		var actualAmount *float64
+		var decayPerWeek *float64
+		var decayStartDate *time.Time
+		if err := rows.Scan(&plannedAmount, &actualAmount, &decayPerWeek, &decayStartDate); err != nil {
+			return 0, err
+		}
+		total += effectiveEntryAmount(plannedAmount, actualAmount, decayPerWeek, decayStartDate)
+	}
+	return total, nil
 }
 
 // latestCardCheckpointForPeriod finds the most recent checkpoint for this
@@ -858,6 +906,55 @@ func UpdateEntry(id int64, e Entry) error {
 			return err
 		}
 	}
+
+	// If this entry IS a card's own repayment item, its paid/unpaid status
+	// feeds sumUnpaidPriorCardBills for every later period of that same card
+	// -- keep them all in sync whenever it changes (e.g. marking it paid).
+	if oldRecurringItemID != nil {
+		var cardID *int64
+		_ = database.QueryRow(`SELECT credit_card_id FROM recurring_items WHERE id=$1`, *oldRecurringItemID).Scan(&cardID)
+		if cardID != nil {
+			if err := recalculateLaterCardEntries(*cardID, periodYear, periodMonth); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// recalculateLaterCardEntries recalculates every already-generated entry for
+// this card's own repayment item in payment periods strictly after
+// (year, month) -- used whenever an earlier period's paid/unpaid status
+// changes, since sumUnpaidPriorCardBills for everything after it depends on it.
+func recalculateLaterCardEntries(cardID int64, year, month int) error {
+	item, found, err := recurringItemForCard(cardID)
+	if err != nil || !found {
+		return err
+	}
+	rows, err := database.Query(`
+		SELECT DISTINCT period_year, period_month FROM entries
+		WHERE recurring_item_id = $1
+		AND (period_year > $2 OR (period_year = $2 AND period_month > $3))`,
+		item.id, year, month)
+	if err != nil {
+		return err
+	}
+	type period struct{ year, month int }
+	var periods []period
+	for rows.Next() {
+		var p period
+		if err := rows.Scan(&p.year, &p.month); err != nil {
+			rows.Close()
+			return err
+		}
+		periods = append(periods, p)
+	}
+	rows.Close()
+	for _, p := range periods {
+		if err := recalculateCardEntry(cardID, p.year, p.month); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -874,6 +971,13 @@ func DeleteEntry(id int64) error {
 	}
 	if recurringItemID == nil && creditCardID != nil {
 		return recalculateCardEntry(*creditCardID, periodYear, periodMonth)
+	}
+	if recurringItemID != nil {
+		var cardID *int64
+		_ = database.QueryRow(`SELECT credit_card_id FROM recurring_items WHERE id=$1`, *recurringItemID).Scan(&cardID)
+		if cardID != nil {
+			return recalculateLaterCardEntries(*cardID, periodYear, periodMonth)
+		}
 	}
 	return nil
 }
