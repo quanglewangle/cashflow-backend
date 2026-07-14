@@ -441,29 +441,42 @@ func sumUnpaidPriorCardBills(cardID int64, year, month int) (float64, error) {
 	if err != nil || !found {
 		return 0, err
 	}
-	rows, err := database.Query(`
-		SELECT planned_amount, actual_amount, decay_per_week, decay_start_date
-		FROM entries
-		WHERE recurring_item_id = $1 AND status != 'incurred'
-		AND (period_year < $2 OR (period_year = $2 AND period_month < $3))`,
-		item.id, year, month)
+	// Only the single period immediately before this one -- a pay-in-full card
+	// realistically has at most one statement awaiting payment at a time. An
+	// older "planned" entry is almost always just never having been marked
+	// paid rather than a genuine pile of unpaid statements, so scanning
+	// further back would wrongly net out settled bills too.
+	prevYear, prevMonth := prevPeriod(year, month)
+	var plannedAmount float64
+	var actualAmount *float64
+	var decayPerWeek *float64
+	var decayStartDate *time.Time
+	var status string
+	err = database.QueryRow(`
+		SELECT planned_amount, actual_amount, decay_per_week, decay_start_date, status
+		FROM entries WHERE recurring_item_id = $1 AND period_year = $2 AND period_month = $3`,
+		item.id, prevYear, prevMonth,
+	).Scan(&plannedAmount, &actualAmount, &decayPerWeek, &decayStartDate, &status)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
-
-	var total float64
-	for rows.Next() {
-		var plannedAmount float64
-		var actualAmount *float64
-		var decayPerWeek *float64
-		var decayStartDate *time.Time
-		if err := rows.Scan(&plannedAmount, &actualAmount, &decayPerWeek, &decayStartDate); err != nil {
-			return 0, err
-		}
-		total += effectiveEntryAmount(plannedAmount, actualAmount, decayPerWeek, decayStartDate)
+	if status == "incurred" {
+		return 0, nil
 	}
-	return total, nil
+	return effectiveEntryAmount(plannedAmount, actualAmount, decayPerWeek, decayStartDate), nil
+}
+
+// prevPeriod steps a (year, month) pair back by one calendar month.
+func prevPeriod(year, month int) (int, int) {
+	month--
+	if month < 1 {
+		month = 12
+		year--
+	}
+	return year, month
 }
 
 // latestCardCheckpointForPeriod finds the most recent checkpoint for this
