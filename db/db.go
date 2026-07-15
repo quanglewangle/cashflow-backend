@@ -317,13 +317,14 @@ func recalculateCardEntry(cardID int64, year, month int) error {
 
 	// Each purchase's payment period depends on paymentPeriodFor, which
 	// isn't expressible as plain SQL, so sum in Go rather than via SUM().
-	total, hasData, err := sumPurchasesForPeriod(cardID, year, month)
+	total, hasData, oneOffTotal, err := sumPurchasesForPeriod(cardID, year, month)
 	if err != nil {
 		return err
 	}
 	if !hasData {
 		total = item.defaultAmount
 	}
+	total += oneOffTotal
 
 	_, err = database.Exec(`
 		INSERT INTO entries (recurring_item_id, category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id)
@@ -342,15 +343,15 @@ func recalculateCardEntry(cardID int64, year, month int) error {
 // are added on top -- otherwise purchases missed by logging (e.g. a Google
 // Pay tap that never got confirmed) would drift the repayment amount away
 // from the real balance forever, since the checkpoint was never consulted.
-func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasData bool, err error) {
+func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasData bool, oneOffTotal float64, err error) {
 	card, err := getCreditCard(cardID)
 	if err != nil {
-		return 0, false, err
+		return 0, false, 0, err
 	}
 
 	checkpoint, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
 	if err != nil {
-		return 0, false, err
+		return 0, false, 0, err
 	}
 	var afterDate time.Time
 	if hasCheckpoint {
@@ -365,7 +366,7 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 		// in here would double it. Net it back out.
 		unpaidPrior, err := sumUnpaidPriorCardBills(cardID, year, month)
 		if err != nil {
-			return 0, false, err
+			return 0, false, 0, err
 		}
 		total -= unpaidPrior
 	}
@@ -373,7 +374,7 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 	rows, err := database.Query(`
 		SELECT amount, purchase_date FROM card_purchases WHERE credit_card_id = $1`, cardID)
 	if err != nil {
-		return 0, false, err
+		return 0, false, 0, err
 	}
 	defer rows.Close()
 
@@ -381,7 +382,7 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 		var amount float64
 		var purchaseDate time.Time
 		if err := rows.Scan(&amount, &purchaseDate); err != nil {
-			return 0, false, err
+			return 0, false, 0, err
 		}
 		py, pm := paymentPeriodFor(card, purchaseDate)
 		if py != year || pm != month {
@@ -400,12 +401,16 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 	// paymentPeriodFor translation needed since they're not dated purchases.
 	// periodNet/periodNetFrom exclude these from the general forecast so they
 	// aren't also counted as an independent line -- they're folded in here.
+	// Kept out of hasData/total deliberately: a lone one-off with no real
+	// checkpoint/purchase data for the period must still ADD ON TOP of the
+	// recurring item's flat default_amount fallback in recalculateCardEntry,
+	// never silently replace it.
 	oneOffRows, err := database.Query(`
 		SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date
 		FROM entries WHERE credit_card_id = $1 AND recurring_item_id IS NULL
 		AND period_year = $2 AND period_month = $3`, cardID, year, month)
 	if err != nil {
-		return 0, false, err
+		return 0, false, 0, err
 	}
 	defer oneOffRows.Close()
 
@@ -416,17 +421,16 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 		var decayPerWeek *float64
 		var decayStartDate *time.Time
 		if err := oneOffRows.Scan(&itemType, &plannedAmount, &actualAmount, &decayPerWeek, &decayStartDate); err != nil {
-			return 0, false, err
+			return 0, false, 0, err
 		}
 		amount := effectiveEntryAmount(plannedAmount, actualAmount, decayPerWeek, decayStartDate)
 		if itemType == "income" {
-			total -= amount
+			oneOffTotal -= amount
 		} else {
-			total += amount
+			oneOffTotal += amount
 		}
-		hasData = true
 	}
-	return total, hasData, nil
+	return total, hasData, oneOffTotal, nil
 }
 
 // sumUnpaidPriorCardBills totals this card's own repayment entries for every
@@ -521,6 +525,7 @@ type CardPaymentBreakdown struct {
 	Purchases           []CardPurchase  `json:"purchases"`
 	OneOffs             []Entry         `json:"one_offs"`              // card-tagged one-offs added on top (e.g. a sundries buffer)
 	UnpaidPriorBill     *Entry          `json:"unpaid_prior_bill"`     // netted out -- see sumUnpaidPriorCardBills
+	DefaultAmountUsed   *float64        `json:"default_amount_used"`   // set when no checkpoint/purchase exists yet and the recurring item's flat default was used instead -- see recalculateCardEntry
 	Total               float64         `json:"total"`
 }
 
@@ -571,6 +576,7 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 	}
 	defer rows.Close()
 
+	hasRealPurchase := false
 	for rows.Next() {
 		var p CardPurchase
 		if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate, &p.RecurringPurchaseID, &p.CategoryID); err != nil {
@@ -586,6 +592,19 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 		}
 		result.Purchases = append(result.Purchases, p)
 		result.Total += p.Amount
+		hasRealPurchase = true
+	}
+
+	// Mirrors recalculateCardEntry: with no checkpoint and nothing real logged
+	// yet for this period, the entry's own total falls back to the recurring
+	// item's flat default_amount -- shown here too so the breakdown matches
+	// what the entry actually displays, with one-offs still added on top below.
+	if !hasCheckpoint && !hasRealPurchase {
+		if item, found, ferr := recurringItemForCard(cardID); ferr == nil && found {
+			amt := item.defaultAmount
+			result.DefaultAmountUsed = &amt
+			result.Total = amt
+		}
 	}
 
 	oneOffs, err := GetCardTaggedOneOffs(cardID, year, month)
