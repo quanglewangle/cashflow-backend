@@ -519,11 +519,14 @@ type CardPaymentBreakdown struct {
 	Checkpoint          *CardCheckpoint `json:"checkpoint"`
 	CoveredByCheckpoint []CardPurchase  `json:"covered_by_checkpoint"`
 	Purchases           []CardPurchase  `json:"purchases"`
+	OneOffs             []Entry         `json:"one_offs"`              // card-tagged one-offs added on top (e.g. a sundries buffer)
+	UnpaidPriorBill     *Entry          `json:"unpaid_prior_bill"`     // netted out -- see sumUnpaidPriorCardBills
 	Total               float64         `json:"total"`
 }
 
 // GetCardPaymentBreakdown mirrors sumPurchasesForPeriod exactly, but returns
-// the checkpoint and purchase list behind the total instead of just the sum.
+// the checkpoint/purchases/one-offs/netted-prior-bill behind the total
+// instead of just the sum.
 func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdown, error) {
 	card, err := getCreditCard(cardID)
 	if err != nil {
@@ -541,6 +544,23 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 		result.Checkpoint = &cp
 		result.Total = checkpoint.Balance
 		afterDate = time.Date(checkpoint.PeriodYear, time.Month(checkpoint.PeriodMonth), checkpoint.PeriodDay, 0, 0, 0, 0, time.UTC)
+
+		prevYear, prevMonth := prevPeriod(year, month)
+		if item, found, err := recurringItemForCard(cardID); err == nil && found {
+			var e Entry
+			err := database.QueryRow(`
+				SELECT id, recurring_item_id, category_id, period_year, period_month, name, item_type,
+				       planned_amount, actual_amount, status, credit_card_id, due_day, decay_per_week, decay_start_date
+				FROM entries WHERE recurring_item_id = $1 AND period_year = $2 AND period_month = $3`,
+				item.id, prevYear, prevMonth,
+			).Scan(&e.ID, &e.RecurringItemID, &e.CategoryID, &e.PeriodYear, &e.PeriodMonth, &e.Name, &e.ItemType,
+				&e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID, &e.DueDay, &e.DecayPerWeek, &e.DecayStartDate)
+			if err == nil && e.Status != "incurred" {
+				e.EffectiveAmount = effectiveEntryAmount(e.PlannedAmount, e.ActualAmount, e.DecayPerWeek, e.DecayStartDate)
+				result.UnpaidPriorBill = &e
+				result.Total -= e.EffectiveAmount
+			}
+		}
 	}
 
 	rows, err := database.Query(`
@@ -566,6 +586,19 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 		}
 		result.Purchases = append(result.Purchases, p)
 		result.Total += p.Amount
+	}
+
+	oneOffs, err := GetCardTaggedOneOffs(cardID, year, month)
+	if err != nil {
+		return CardPaymentBreakdown{}, err
+	}
+	for _, e := range oneOffs {
+		result.OneOffs = append(result.OneOffs, e)
+		if e.ItemType == "income" {
+			result.Total -= e.EffectiveAmount
+		} else {
+			result.Total += e.EffectiveAmount
+		}
 	}
 	return result, nil
 }
