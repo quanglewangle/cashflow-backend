@@ -372,7 +372,7 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 	}
 
 	rows, err := database.Query(`
-		SELECT amount, purchase_date FROM card_purchases WHERE credit_card_id = $1`, cardID)
+		SELECT amount, purchase_date, recurring_purchase_id FROM card_purchases WHERE credit_card_id = $1`, cardID)
 	if err != nil {
 		return 0, false, 0, err
 	}
@@ -381,7 +381,8 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 	for rows.Next() {
 		var amount float64
 		var purchaseDate time.Time
-		if err := rows.Scan(&amount, &purchaseDate); err != nil {
+		var recurringPurchaseID *int64
+		if err := rows.Scan(&amount, &purchaseDate, &recurringPurchaseID); err != nil {
 			return 0, false, 0, err
 		}
 		py, pm := paymentPeriodFor(card, purchaseDate)
@@ -391,8 +392,23 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 		if hasCheckpoint && !purchaseDate.After(afterDate) {
 			continue // already reflected in the checkpoint balance
 		}
-		total += amount
-		hasData = true
+		if hasCheckpoint || recurringPurchaseID == nil {
+			// A checkpoint anchors the whole period regardless of origin, and an
+			// organic purchase (manually logged, Google Pay, PayPal) can only ever
+			// be dated today or earlier -- either way, this is genuine evidence
+			// the period is actively tracked, so it's fine to suppress the
+			// default_amount fallback.
+			total += amount
+			hasData = true
+		} else {
+			// A recurring card subscription (e.g. a small monthly charge) gets its
+			// card_purchases rows pre-generated for future periods nobody has
+			// started tracking yet -- on its own that shouldn't count as "this
+			// period has real data" (it would wrongly suppress a much larger
+			// default_amount estimate down to just this subscription's amount),
+			// but it must still be added on top once the fallback decision is made.
+			oneOffTotal += amount
+		}
 	}
 
 	// One-off entries deliberately tagged with this card (e.g. a decaying
@@ -577,6 +593,7 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 	defer rows.Close()
 
 	hasRealPurchase := false
+	var subscriptionOnlyTotal float64
 	for rows.Next() {
 		var p CardPurchase
 		if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate, &p.RecurringPurchaseID, &p.CategoryID); err != nil {
@@ -591,8 +608,18 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 			continue
 		}
 		result.Purchases = append(result.Purchases, p)
-		result.Total += p.Amount
-		hasRealPurchase = true
+		// A recurring subscription's purchase can be pre-generated for a future
+		// period nobody has started tracking yet -- see sumPurchasesForPeriod --
+		// so on its own (no checkpoint) it shouldn't count as "real" for the
+		// purpose of deciding whether to also apply the default_amount fallback;
+		// its amount is held back and added on top below instead, alongside the
+		// fallback decision, rather than into result.Total directly here.
+		if hasCheckpoint || p.RecurringPurchaseID == nil {
+			result.Total += p.Amount
+			hasRealPurchase = true
+		} else {
+			subscriptionOnlyTotal += p.Amount
+		}
 	}
 
 	// Mirrors recalculateCardEntry: with no checkpoint and nothing real logged
@@ -606,6 +633,7 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 			result.Total = amt
 		}
 	}
+	result.Total += subscriptionOnlyTotal
 
 	oneOffs, err := GetCardTaggedOneOffs(cardID, year, month)
 	if err != nil {
