@@ -315,6 +315,39 @@ func recalculateCardEntry(cardID int64, year, month int) error {
 		return nil // no recurring item wired to this card -- nothing to keep in sync
 	}
 
+	// A user can directly overwrite a future period's payment with a what-if
+	// guess (see UpdateEntry). That guess sticks -- this function leaves it
+	// alone entirely -- until a real checkpoint anchors the period, at which
+	// point the checkpoint always wins: the flag is cleared below and normal
+	// recalculation resumes.
+	var manuallySet bool
+	_ = database.QueryRow(`
+		SELECT manually_set FROM entries WHERE recurring_item_id=$1 AND period_year=$2 AND period_month=$3`,
+		item.id, year, month,
+	).Scan(&manuallySet)
+
+	card, err := getCreditCard(cardID)
+	if err != nil {
+		return err
+	}
+	_, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
+	if err != nil {
+		return err
+	}
+
+	if manuallySet {
+		if !hasCheckpoint {
+			return nil // leave the what-if guess (and any decay on it) untouched
+		}
+		if _, err := database.Exec(`
+			UPDATE entries SET manually_set = FALSE
+			WHERE recurring_item_id=$1 AND period_year=$2 AND period_month=$3`,
+			item.id, year, month,
+		); err != nil {
+			return err
+		}
+	}
+
 	// Each purchase's payment period depends on paymentPeriodFor, which
 	// isn't expressible as plain SQL, so sum in Go rather than via SUM().
 	total, hasData, oneOffTotal, err := sumPurchasesForPeriod(cardID, year, month)
@@ -1007,6 +1040,15 @@ func UpdateEntry(id int64, e Entry) error {
 		var cardID *int64
 		_ = database.QueryRow(`SELECT credit_card_id FROM recurring_items WHERE id=$1`, *oldRecurringItemID).Scan(&cardID)
 		if cardID != nil {
+			// This endpoint is never called by the automatic recalculation path
+			// (recalculateCardEntry writes planned_amount directly via SQL), so
+			// reaching here means a user deliberately edited the card's own
+			// payment total -- a what-if guess for this period. Mark it so
+			// recalculateCardEntry leaves it alone until a real checkpoint
+			// supersedes it.
+			if _, err := database.Exec(`UPDATE entries SET manually_set = TRUE WHERE id=$1`, id); err != nil {
+				return err
+			}
 			if err := recalculateLaterCardEntries(*cardID, periodYear, periodMonth); err != nil {
 				return err
 			}
