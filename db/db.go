@@ -575,6 +575,8 @@ type CardPaymentBreakdown struct {
 	OneOffs             []Entry         `json:"one_offs"`              // card-tagged one-offs added on top (e.g. a sundries buffer)
 	UnpaidPriorBill     *Entry          `json:"unpaid_prior_bill"`     // netted out -- see sumUnpaidPriorCardBills
 	DefaultAmountUsed   *float64        `json:"default_amount_used"`   // set when no checkpoint/purchase exists yet and the recurring item's flat default was used instead -- see recalculateCardEntry
+	EntryID             *int64          `json:"entry_id"`              // the card's own generated entry for this period, for editing it directly
+	ManuallySet         bool            `json:"manually_set"`          // true if EntryID's amount is a what-if override -- see recalculateCardEntry
 	Total               float64         `json:"total"`
 }
 
@@ -587,11 +589,36 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 		return CardPaymentBreakdown{}, err
 	}
 
+	result := CardPaymentBreakdown{}
+	if item, found, ferr := recurringItemForCard(cardID); ferr == nil && found {
+		var entryID int64
+		var plannedAmount float64
+		var manuallySet bool
+		err := database.QueryRow(`
+			SELECT id, planned_amount, manually_set FROM entries
+			WHERE recurring_item_id=$1 AND period_year=$2 AND period_month=$3`,
+			item.id, year, month,
+		).Scan(&entryID, &plannedAmount, &manuallySet)
+		if err == nil {
+			result.EntryID = &entryID
+			result.ManuallySet = manuallySet
+			if manuallySet {
+				// Mirrors recalculateCardEntry: a what-if override sticks until a
+				// real checkpoint supersedes it, so skip the checkpoint/purchase
+				// narrative entirely and just report the override itself.
+				_, hasCheckpoint, cerr := latestCardCheckpointForPeriod(card, year, month)
+				if cerr == nil && !hasCheckpoint {
+					result.Total = plannedAmount
+					return result, nil
+				}
+			}
+		}
+	}
+
 	checkpoint, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
 	if err != nil {
 		return CardPaymentBreakdown{}, err
 	}
-	result := CardPaymentBreakdown{}
 	var afterDate time.Time
 	if hasCheckpoint {
 		cp := checkpoint
