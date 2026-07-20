@@ -110,6 +110,10 @@ type Entry struct {
 	DueDay          *int       `json:"due_day"`
 	DecayPerWeek    *float64   `json:"decay_per_week"`
 	DecayStartDate  *time.Time `json:"decay_start_date"`
+	// IncurredDate is when this entry's status last became incurred -- only
+	// populated by queries that need it (see sumUnpaidPriorCardBills), not
+	// exposed to the client.
+	IncurredDate *time.Time `json:"-"`
 	// EffectiveAmount is PlannedAmount with any decay applied as of now --
 	// computed at read time, never stored. Client display/balance math
 	// should prefer this over PlannedAmount; edit dialogs should still
@@ -397,7 +401,7 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 		// yet -- that amount is already baked into checkpoint.Balance, but it's
 		// also counted on its own as that earlier period's entry, so leaving it
 		// in here would double it. Net it back out.
-		unpaidPrior, err := sumUnpaidPriorCardBills(cardID, year, month)
+		_, unpaidPrior, err := sumUnpaidPriorCardBills(cardID, year, month, afterDate)
 		if err != nil {
 			return 0, false, 0, err
 		}
@@ -482,17 +486,22 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 	return total, hasData, oneOffTotal, nil
 }
 
-// sumUnpaidPriorCardBills totals this card's own repayment entries for every
-// payment period strictly before (year, month) that aren't marked incurred
-// yet -- amounts a checkpoint dated after those periods closed would already
-// include in its running balance, but that are still due to be settled on
-// their own as that earlier period's entry. Returns 0 if the card has no
-// dedicated repayment recurring item (e.g. Barclaycard, paid down by a fixed
-// amount rather than in full each cycle -- see recurringItemForCard).
-func sumUnpaidPriorCardBills(cardID int64, year, month int) (float64, error) {
+// sumUnpaidPriorCardBills finds this card's own repayment entry for the
+// payment period strictly before (year, month), and returns it (plus its
+// effective amount) if it's still due to be netted out of checkpointDate's
+// balance -- amounts a checkpoint dated after that period's bill was paid
+// would already exclude from its running balance, but a checkpoint dated
+// before the payment still has the old bill baked in regardless of the
+// entry's current status, since marking an entry incurred doesn't
+// retroactively change an already-recorded checkpoint. Returns nil if the
+// card has no dedicated repayment recurring item (e.g. Barclaycard, paid
+// down by a fixed amount rather than in full each cycle -- see
+// recurringItemForCard), or if the prior bill is already reflected in
+// checkpointDate's balance.
+func sumUnpaidPriorCardBills(cardID int64, year, month int, checkpointDate time.Time) (*Entry, float64, error) {
 	item, found, err := recurringItemForCard(cardID)
 	if err != nil || !found {
-		return 0, err
+		return nil, 0, err
 	}
 	// Only the single period immediately before this one -- a pay-in-full card
 	// realistically has at most one statement awaiting payment at a time. An
@@ -500,26 +509,27 @@ func sumUnpaidPriorCardBills(cardID int64, year, month int) (float64, error) {
 	// paid rather than a genuine pile of unpaid statements, so scanning
 	// further back would wrongly net out settled bills too.
 	prevYear, prevMonth := prevPeriod(year, month)
-	var plannedAmount float64
-	var actualAmount *float64
-	var decayPerWeek *float64
-	var decayStartDate *time.Time
-	var status string
+	var e Entry
 	err = database.QueryRow(`
-		SELECT planned_amount, actual_amount, decay_per_week, decay_start_date, status
+		SELECT id, recurring_item_id, category_id, period_year, period_month, name, item_type,
+		       planned_amount, actual_amount, status, credit_card_id, due_day, decay_per_week,
+		       decay_start_date, incurred_date
 		FROM entries WHERE recurring_item_id = $1 AND period_year = $2 AND period_month = $3`,
 		item.id, prevYear, prevMonth,
-	).Scan(&plannedAmount, &actualAmount, &decayPerWeek, &decayStartDate, &status)
+	).Scan(&e.ID, &e.RecurringItemID, &e.CategoryID, &e.PeriodYear, &e.PeriodMonth, &e.Name, &e.ItemType,
+		&e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID, &e.DueDay, &e.DecayPerWeek,
+		&e.DecayStartDate, &e.IncurredDate)
 	if err == sql.ErrNoRows {
-		return 0, nil
+		return nil, 0, nil
 	}
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
-	if status == "incurred" {
-		return 0, nil
+	if e.Status == "incurred" && e.IncurredDate != nil && !e.IncurredDate.After(checkpointDate) {
+		return nil, 0, nil
 	}
-	return effectiveEntryAmount(plannedAmount, actualAmount, decayPerWeek, decayStartDate), nil
+	e.EffectiveAmount = effectiveEntryAmount(e.PlannedAmount, e.ActualAmount, e.DecayPerWeek, e.DecayStartDate)
+	return &e, e.EffectiveAmount, nil
 }
 
 // prevPeriod steps a (year, month) pair back by one calendar month.
@@ -626,21 +636,13 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 		result.Total = checkpoint.Balance
 		afterDate = time.Date(checkpoint.PeriodYear, time.Month(checkpoint.PeriodMonth), checkpoint.PeriodDay, 0, 0, 0, 0, time.UTC)
 
-		prevYear, prevMonth := prevPeriod(year, month)
-		if item, found, err := recurringItemForCard(cardID); err == nil && found {
-			var e Entry
-			err := database.QueryRow(`
-				SELECT id, recurring_item_id, category_id, period_year, period_month, name, item_type,
-				       planned_amount, actual_amount, status, credit_card_id, due_day, decay_per_week, decay_start_date
-				FROM entries WHERE recurring_item_id = $1 AND period_year = $2 AND period_month = $3`,
-				item.id, prevYear, prevMonth,
-			).Scan(&e.ID, &e.RecurringItemID, &e.CategoryID, &e.PeriodYear, &e.PeriodMonth, &e.Name, &e.ItemType,
-				&e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID, &e.DueDay, &e.DecayPerWeek, &e.DecayStartDate)
-			if err == nil && e.Status != "incurred" {
-				e.EffectiveAmount = effectiveEntryAmount(e.PlannedAmount, e.ActualAmount, e.DecayPerWeek, e.DecayStartDate)
-				result.UnpaidPriorBill = &e
-				result.Total -= e.EffectiveAmount
-			}
+		entry, unpaidAmount, err := sumUnpaidPriorCardBills(cardID, year, month, afterDate)
+		if err != nil {
+			return CardPaymentBreakdown{}, err
+		}
+		if entry != nil {
+			result.UnpaidPriorBill = entry
+			result.Total -= unpaidAmount
 		}
 	}
 
@@ -1030,17 +1032,33 @@ func UpdateEntry(id int64, e Entry) error {
 	var oldRecurringItemID *int64
 	var oldCreditCardID *int64
 	var periodYear, periodMonth int
-	_ = database.QueryRow(`SELECT recurring_item_id, credit_card_id, period_year, period_month FROM entries WHERE id=$1`, id).
-		Scan(&oldRecurringItemID, &oldCreditCardID, &periodYear, &periodMonth)
+	var oldStatus string
+	_ = database.QueryRow(`SELECT recurring_item_id, credit_card_id, period_year, period_month, status FROM entries WHERE id=$1`, id).
+		Scan(&oldRecurringItemID, &oldCreditCardID, &periodYear, &periodMonth, &oldStatus)
+
+	// incurred_date records when this entry actually became incurred, so a
+	// card's checkpoint anchoring a later period can tell whether it was
+	// taken before or after -- see sumUnpaidPriorCardBills. Only stamped on
+	// the planned -> incurred transition; left untouched on a no-op re-save,
+	// and cleared if reverted back to planned.
+	var incurredDate *time.Time
+	if e.Status == "incurred" {
+		if oldStatus == "incurred" {
+			_ = database.QueryRow(`SELECT incurred_date FROM entries WHERE id=$1`, id).Scan(&incurredDate)
+		} else {
+			today := time.Now().Truncate(24 * time.Hour)
+			incurredDate = &today
+		}
+	}
 
 	_, err := database.Exec(`
 		UPDATE entries SET
 			category_id=$2, name=$3, item_type=$4, planned_amount=$5,
 			actual_amount=$6, status=$7, credit_card_id=$8, due_day=$9,
-			decay_per_week=$10, decay_start_date=$11
+			decay_per_week=$10, decay_start_date=$11, incurred_date=$12
 		WHERE id=$1`,
 		id, e.CategoryID, e.Name, e.ItemType, e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID, e.DueDay,
-		e.DecayPerWeek, e.DecayStartDate,
+		e.DecayPerWeek, e.DecayStartDate, incurredDate,
 	)
 	if err != nil {
 		return err
