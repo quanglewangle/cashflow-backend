@@ -23,7 +23,7 @@ INSERT INTO recurring_items (category_id, name, item_type, frequency, default_am
     (2, 'Octopus',              'expense', 'monthly',  80.00, NULL, NULL, TRUE),
     (2, 'Charity',              'expense', 'monthly',  30.00, NULL, NULL, TRUE),
     (2, 'Plusnet',              'expense', 'monthly',  25.00, 18, NULL, TRUE),
-    (2, 'Visacard',             'expense', 'monthly', 600.00, 9,  1,    TRUE),
+    (2, 'Visacard',             'expense', 'monthly',   0.00, 9,  1,    TRUE),
     (2, 'Barclaycard',          'expense', 'monthly', 170.00, 19, 2,    TRUE),
     (2, 'repay Marcus',         'expense', 'monthly', 500.00, NULL, NULL, TRUE),
     (2, 'Jack & Archie',        'expense', 'monthly',  60.00, NULL, NULL, TRUE),
