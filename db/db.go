@@ -53,6 +53,11 @@ type CreditCard struct {
 	StatementDay          int    `json:"statement_day"`
 	PaymentDueDay         int    `json:"payment_due_day"`
 	PaymentDueMonthOffset int    `json:"payment_due_month_offset"`
+	// CarriesBalance: false (default) means the card is paid off in full
+	// each cycle (payment reconstructed from checkpoints/purchases); true
+	// means a fixed installment against a revolving balance -- see
+	// sumPurchasesForPeriod/recalculateCardEntry/CurrentCardBalance.
+	CarriesBalance bool `json:"carries_balance"`
 }
 
 type CardPurchase struct {
@@ -199,7 +204,7 @@ func UpdateCategory(id int64, c Category) error {
 // ---- Credit cards ----
 
 func GetCreditCards() ([]CreditCard, error) {
-	rows, err := database.Query(`SELECT id, name, statement_day, payment_due_day, payment_due_month_offset FROM credit_cards ORDER BY id`)
+	rows, err := database.Query(`SELECT id, name, statement_day, payment_due_day, payment_due_month_offset, carries_balance FROM credit_cards ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +212,7 @@ func GetCreditCards() ([]CreditCard, error) {
 	var out []CreditCard
 	for rows.Next() {
 		var c CreditCard
-		if err := rows.Scan(&c.ID, &c.Name, &c.StatementDay, &c.PaymentDueDay, &c.PaymentDueMonthOffset); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.StatementDay, &c.PaymentDueDay, &c.PaymentDueMonthOffset, &c.CarriesBalance); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -218,8 +223,8 @@ func GetCreditCards() ([]CreditCard, error) {
 func getCreditCard(id int64) (CreditCard, error) {
 	var c CreditCard
 	err := database.QueryRow(
-		`SELECT id, name, statement_day, payment_due_day, payment_due_month_offset FROM credit_cards WHERE id=$1`, id,
-	).Scan(&c.ID, &c.Name, &c.StatementDay, &c.PaymentDueDay, &c.PaymentDueMonthOffset)
+		`SELECT id, name, statement_day, payment_due_day, payment_due_month_offset, carries_balance FROM credit_cards WHERE id=$1`, id,
+	).Scan(&c.ID, &c.Name, &c.StatementDay, &c.PaymentDueDay, &c.PaymentDueMonthOffset, &c.CarriesBalance)
 	return c, err
 }
 
@@ -229,8 +234,8 @@ func AddCreditCard(c CreditCard) (int64, error) {
 	}
 	var id int64
 	err := database.QueryRow(
-		`INSERT INTO credit_cards (name, statement_day, payment_due_day, payment_due_month_offset) VALUES ($1, $2, $3, $4) RETURNING id`,
-		c.Name, c.StatementDay, c.PaymentDueDay, c.PaymentDueMonthOffset,
+		`INSERT INTO credit_cards (name, statement_day, payment_due_day, payment_due_month_offset, carries_balance) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		c.Name, c.StatementDay, c.PaymentDueDay, c.PaymentDueMonthOffset, c.CarriesBalance,
 	).Scan(&id)
 	return id, err
 }
@@ -240,8 +245,8 @@ func UpdateCreditCard(id int64, c CreditCard) error {
 		c.PaymentDueMonthOffset = 1
 	}
 	_, err := database.Exec(
-		`UPDATE credit_cards SET name=$2, statement_day=$3, payment_due_day=$4, payment_due_month_offset=$5 WHERE id=$1`,
-		id, c.Name, c.StatementDay, c.PaymentDueDay, c.PaymentDueMonthOffset,
+		`UPDATE credit_cards SET name=$2, statement_day=$3, payment_due_day=$4, payment_due_month_offset=$5, carries_balance=$6 WHERE id=$1`,
+		id, c.Name, c.StatementDay, c.PaymentDueDay, c.PaymentDueMonthOffset, c.CarriesBalance,
 	)
 	return err
 }
@@ -319,27 +324,34 @@ func recalculateCardEntry(cardID int64, year, month int) error {
 		return nil // no recurring item wired to this card -- nothing to keep in sync
 	}
 
+	card, err := getCreditCard(cardID)
+	if err != nil {
+		return err
+	}
+
 	// A user can directly overwrite a future period's payment with a what-if
 	// guess (see UpdateEntry). That guess sticks -- this function leaves it
 	// alone entirely -- until a real checkpoint anchors the period, at which
 	// point the checkpoint always wins: the flag is cleared below and normal
-	// recalculation resumes.
+	// recalculation resumes. For a carries_balance card, checkpoints don't
+	// drive the payment amount at all (see sumPurchasesForPeriod), so they
+	// can't clear an override either -- it just sticks for this one period; a
+	// fresh period's row is always inserted un-flagged (see the INSERT below),
+	// so this is self-limiting rather than stuck forever.
 	var manuallySet bool
 	_ = database.QueryRow(`
 		SELECT manually_set FROM entries WHERE recurring_item_id=$1 AND period_year=$2 AND period_month=$3`,
 		item.id, year, month,
 	).Scan(&manuallySet)
 
-	card, err := getCreditCard(cardID)
-	if err != nil {
-		return err
-	}
-	_, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
-	if err != nil {
-		return err
-	}
-
 	if manuallySet {
+		if card.CarriesBalance {
+			return nil
+		}
+		_, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
+		if err != nil {
+			return err
+		}
 		if !hasCheckpoint {
 			return nil // leave the what-if guess (and any decay on it) untouched
 		}
@@ -386,65 +398,73 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 		return 0, false, 0, err
 	}
 
-	checkpoint, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
-	if err != nil {
-		return 0, false, 0, err
-	}
-	var afterDate time.Time
-	if hasCheckpoint {
-		total = checkpoint.Balance
-		hasData = true
-		afterDate = time.Date(checkpoint.PeriodYear, time.Month(checkpoint.PeriodMonth), checkpoint.PeriodDay, 0, 0, 0, 0, time.UTC)
-
-		// A checkpoint is a snapshot of everything posted to the card up to that
-		// date, including any earlier statement's bill that hasn't been paid off
-		// yet -- that amount is already baked into checkpoint.Balance, but it's
-		// also counted on its own as that earlier period's entry, so leaving it
-		// in here would double it. Net it back out.
-		_, unpaidPrior, err := sumUnpaidPriorCardBills(cardID, year, month, afterDate)
+	// carries_balance cards (a fixed installment against a revolving balance,
+	// e.g. a promotional-rate paydown) never derive their period payment from
+	// checkpoints/purchases -- total/hasData stay zero/false so
+	// recalculateCardEntry's default_amount fallback always fires, same as
+	// "nothing logged yet" does for a pay-in-full card. Checkpoints/purchases
+	// still feed CurrentCardBalance separately, just not this total.
+	if !card.CarriesBalance {
+		checkpoint, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
 		if err != nil {
 			return 0, false, 0, err
 		}
-		total -= unpaidPrior
-	}
+		var afterDate time.Time
+		if hasCheckpoint {
+			total = checkpoint.Balance
+			hasData = true
+			afterDate = time.Date(checkpoint.PeriodYear, time.Month(checkpoint.PeriodMonth), checkpoint.PeriodDay, 0, 0, 0, 0, time.UTC)
 
-	rows, err := database.Query(`
-		SELECT amount, purchase_date, recurring_purchase_id FROM card_purchases WHERE credit_card_id = $1`, cardID)
-	if err != nil {
-		return 0, false, 0, err
-	}
-	defer rows.Close()
+			// A checkpoint is a snapshot of everything posted to the card up to that
+			// date, including any earlier statement's bill that hasn't been paid off
+			// yet -- that amount is already baked into checkpoint.Balance, but it's
+			// also counted on its own as that earlier period's entry, so leaving it
+			// in here would double it. Net it back out.
+			_, unpaidPrior, err := sumUnpaidPriorCardBills(cardID, year, month, afterDate)
+			if err != nil {
+				return 0, false, 0, err
+			}
+			total -= unpaidPrior
+		}
 
-	for rows.Next() {
-		var amount float64
-		var purchaseDate time.Time
-		var recurringPurchaseID *int64
-		if err := rows.Scan(&amount, &purchaseDate, &recurringPurchaseID); err != nil {
+		rows, err := database.Query(`
+			SELECT amount, purchase_date, recurring_purchase_id FROM card_purchases WHERE credit_card_id = $1`, cardID)
+		if err != nil {
 			return 0, false, 0, err
 		}
-		py, pm := paymentPeriodFor(card, purchaseDate)
-		if py != year || pm != month {
-			continue
-		}
-		if hasCheckpoint && !purchaseDate.After(afterDate) {
-			continue // already reflected in the checkpoint balance
-		}
-		if hasCheckpoint || recurringPurchaseID == nil {
-			// A checkpoint anchors the whole period regardless of origin, and an
-			// organic purchase (manually logged, Google Pay, PayPal) can only ever
-			// be dated today or earlier -- either way, this is genuine evidence
-			// the period is actively tracked, so it's fine to suppress the
-			// default_amount fallback.
-			total += amount
-			hasData = true
-		} else {
-			// A recurring card subscription (e.g. a small monthly charge) gets its
-			// card_purchases rows pre-generated for future periods nobody has
-			// started tracking yet -- on its own that shouldn't count as "this
-			// period has real data" (it would wrongly suppress a much larger
-			// default_amount estimate down to just this subscription's amount),
-			// but it must still be added on top once the fallback decision is made.
-			oneOffTotal += amount
+		defer rows.Close()
+
+		for rows.Next() {
+			var amount float64
+			var purchaseDate time.Time
+			var recurringPurchaseID *int64
+			if err := rows.Scan(&amount, &purchaseDate, &recurringPurchaseID); err != nil {
+				return 0, false, 0, err
+			}
+			py, pm := paymentPeriodFor(card, purchaseDate)
+			if py != year || pm != month {
+				continue
+			}
+			if hasCheckpoint && !purchaseDate.After(afterDate) {
+				continue // already reflected in the checkpoint balance
+			}
+			if hasCheckpoint || recurringPurchaseID == nil {
+				// A checkpoint anchors the whole period regardless of origin, and an
+				// organic purchase (manually logged, Google Pay, PayPal) can only ever
+				// be dated today or earlier -- either way, this is genuine evidence
+				// the period is actively tracked, so it's fine to suppress the
+				// default_amount fallback.
+				total += amount
+				hasData = true
+			} else {
+				// A recurring card subscription (e.g. a small monthly charge) gets its
+				// card_purchases rows pre-generated for future periods nobody has
+				// started tracking yet -- on its own that shouldn't count as "this
+				// period has real data" (it would wrongly suppress a much larger
+				// default_amount estimate down to just this subscription's amount),
+				// but it must still be added on top once the fallback decision is made.
+				oneOffTotal += amount
+			}
 		}
 	}
 
@@ -615,7 +635,13 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 			if manuallySet {
 				// Mirrors recalculateCardEntry: a what-if override sticks until a
 				// real checkpoint supersedes it, so skip the checkpoint/purchase
-				// narrative entirely and just report the override itself.
+				// narrative entirely and just report the override itself. A
+				// carries_balance card's checkpoints never supersede an override
+				// at all (see recalculateCardEntry), so always short-circuit here.
+				if card.CarriesBalance {
+					result.Total = plannedAmount
+					return result, nil
+				}
 				_, hasCheckpoint, cerr := latestCardCheckpointForPeriod(card, year, month)
 				if cerr == nil && !hasCheckpoint {
 					result.Total = plannedAmount
@@ -625,77 +651,90 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 		}
 	}
 
-	checkpoint, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
-	if err != nil {
-		return CardPaymentBreakdown{}, err
-	}
-	var afterDate time.Time
-	if hasCheckpoint {
-		cp := checkpoint
-		result.Checkpoint = &cp
-		result.Total = checkpoint.Balance
-		afterDate = time.Date(checkpoint.PeriodYear, time.Month(checkpoint.PeriodMonth), checkpoint.PeriodDay, 0, 0, 0, 0, time.UTC)
-
-		entry, unpaidAmount, err := sumUnpaidPriorCardBills(cardID, year, month, afterDate)
-		if err != nil {
-			return CardPaymentBreakdown{}, err
-		}
-		if entry != nil {
-			result.UnpaidPriorBill = entry
-			result.Total -= unpaidAmount
-		}
-	}
-
-	rows, err := database.Query(`
-		SELECT id, credit_card_id, description, amount, purchase_date, recurring_purchase_id, category_id
-		FROM card_purchases WHERE credit_card_id = $1 ORDER BY purchase_date, id`, cardID)
-	if err != nil {
-		return CardPaymentBreakdown{}, err
-	}
-	defer rows.Close()
-
-	hasRealPurchase := false
-	var subscriptionOnlyTotal float64
-	for rows.Next() {
-		var p CardPurchase
-		if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate, &p.RecurringPurchaseID, &p.CategoryID); err != nil {
-			return CardPaymentBreakdown{}, err
-		}
-		py, pm := paymentPeriodFor(card, p.PurchaseDate)
-		if py != year || pm != month {
-			continue
-		}
-		if hasCheckpoint && !p.PurchaseDate.After(afterDate) {
-			result.CoveredByCheckpoint = append(result.CoveredByCheckpoint, p)
-			continue
-		}
-		result.Purchases = append(result.Purchases, p)
-		// A recurring subscription's purchase can be pre-generated for a future
-		// period nobody has started tracking yet -- see sumPurchasesForPeriod --
-		// so on its own (no checkpoint) it shouldn't count as "real" for the
-		// purpose of deciding whether to also apply the default_amount fallback;
-		// its amount is held back and added on top below instead, alongside the
-		// fallback decision, rather than into result.Total directly here.
-		if hasCheckpoint || p.RecurringPurchaseID == nil {
-			result.Total += p.Amount
-			hasRealPurchase = true
-		} else {
-			subscriptionOnlyTotal += p.Amount
-		}
-	}
-
-	// Mirrors recalculateCardEntry: with no checkpoint and nothing real logged
-	// yet for this period, the entry's own total falls back to the recurring
-	// item's flat default_amount -- shown here too so the breakdown matches
-	// what the entry actually displays, with one-offs still added on top below.
-	if !hasCheckpoint && !hasRealPurchase {
+	if card.CarriesBalance {
+		// Checkpoints/purchases never drive this card's payment amount (see
+		// sumPurchasesForPeriod) -- the breakdown mirrors that honestly by
+		// leaving checkpoint/purchases empty and showing just the fixed
+		// default_amount, same as "nothing logged yet" would for a
+		// pay-in-full card.
 		if item, found, ferr := recurringItemForCard(cardID); ferr == nil && found {
 			amt := item.defaultAmount
 			result.DefaultAmountUsed = &amt
 			result.Total = amt
 		}
+	} else {
+		checkpoint, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
+		if err != nil {
+			return CardPaymentBreakdown{}, err
+		}
+		var afterDate time.Time
+		if hasCheckpoint {
+			cp := checkpoint
+			result.Checkpoint = &cp
+			result.Total = checkpoint.Balance
+			afterDate = time.Date(checkpoint.PeriodYear, time.Month(checkpoint.PeriodMonth), checkpoint.PeriodDay, 0, 0, 0, 0, time.UTC)
+
+			entry, unpaidAmount, err := sumUnpaidPriorCardBills(cardID, year, month, afterDate)
+			if err != nil {
+				return CardPaymentBreakdown{}, err
+			}
+			if entry != nil {
+				result.UnpaidPriorBill = entry
+				result.Total -= unpaidAmount
+			}
+		}
+
+		rows, err := database.Query(`
+			SELECT id, credit_card_id, description, amount, purchase_date, recurring_purchase_id, category_id
+			FROM card_purchases WHERE credit_card_id = $1 ORDER BY purchase_date, id`, cardID)
+		if err != nil {
+			return CardPaymentBreakdown{}, err
+		}
+		defer rows.Close()
+
+		hasRealPurchase := false
+		var subscriptionOnlyTotal float64
+		for rows.Next() {
+			var p CardPurchase
+			if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate, &p.RecurringPurchaseID, &p.CategoryID); err != nil {
+				return CardPaymentBreakdown{}, err
+			}
+			py, pm := paymentPeriodFor(card, p.PurchaseDate)
+			if py != year || pm != month {
+				continue
+			}
+			if hasCheckpoint && !p.PurchaseDate.After(afterDate) {
+				result.CoveredByCheckpoint = append(result.CoveredByCheckpoint, p)
+				continue
+			}
+			result.Purchases = append(result.Purchases, p)
+			// A recurring subscription's purchase can be pre-generated for a future
+			// period nobody has started tracking yet -- see sumPurchasesForPeriod --
+			// so on its own (no checkpoint) it shouldn't count as "real" for the
+			// purpose of deciding whether to also apply the default_amount fallback;
+			// its amount is held back and added on top below instead, alongside the
+			// fallback decision, rather than into result.Total directly here.
+			if hasCheckpoint || p.RecurringPurchaseID == nil {
+				result.Total += p.Amount
+				hasRealPurchase = true
+			} else {
+				subscriptionOnlyTotal += p.Amount
+			}
+		}
+
+		// Mirrors recalculateCardEntry: with no checkpoint and nothing real logged
+		// yet for this period, the entry's own total falls back to the recurring
+		// item's flat default_amount -- shown here too so the breakdown matches
+		// what the entry actually displays, with one-offs still added on top below.
+		if !hasCheckpoint && !hasRealPurchase {
+			if item, found, ferr := recurringItemForCard(cardID); ferr == nil && found {
+				amt := item.defaultAmount
+				result.DefaultAmountUsed = &amt
+				result.Total = amt
+			}
+		}
+		result.Total += subscriptionOnlyTotal
 	}
-	result.Total += subscriptionOnlyTotal
 
 	oneOffs, err := GetCardTaggedOneOffs(cardID, year, month)
 	if err != nil {
@@ -1590,6 +1629,76 @@ func DeleteCardCheckpoint(id int64) error {
 		return err
 	}
 	return recalculateCheckpointPeriod(creditCardID, year, month, day)
+}
+
+// CurrentCardBalance estimates what's currently owed on a card right now:
+// the most recent checkpoint recorded for it (any period -- unlike
+// latestCardCheckpointForPeriod, which is deliberately period-scoped), minus
+// this card's own fixed-installment payments actually incurred since that
+// checkpoint's date, plus any purchases charged to the card since that
+// date -- both of which a checkpoint, being a single point-in-time snapshot,
+// doesn't yet reflect. Intended for carries_balance cards (a revolving
+// balance paid down by a fixed monthly amount), where the period payment
+// itself no longer tracks the real balance -- see recalculateCardEntry.
+// Returns found=false if the card has no checkpoint recorded yet.
+func CurrentCardBalance(cardID int64) (balance float64, found bool, err error) {
+	var cp CardCheckpoint
+	err = database.QueryRow(`
+		SELECT id, credit_card_id, period_year, period_month, period_day, balance
+		FROM card_checkpoints WHERE credit_card_id = $1
+		ORDER BY period_year DESC, period_month DESC, period_day DESC, id DESC LIMIT 1`, cardID,
+	).Scan(&cp.ID, &cp.CreditCardID, &cp.PeriodYear, &cp.PeriodMonth, &cp.PeriodDay, &cp.Balance)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	checkpointDate := time.Date(cp.PeriodYear, time.Month(cp.PeriodMonth), cp.PeriodDay, 0, 0, 0, 0, time.UTC)
+	balance = cp.Balance
+
+	item, itemFound, err := recurringItemForCard(cardID)
+	if err != nil {
+		return 0, false, err
+	}
+	if itemFound {
+		rows, err := database.Query(`
+			SELECT planned_amount, actual_amount, decay_per_week, decay_start_date
+			FROM entries
+			WHERE recurring_item_id = $1 AND status = 'incurred' AND incurred_date > $2`,
+			item.id, checkpointDate)
+		if err != nil {
+			return 0, false, err
+		}
+		for rows.Next() {
+			var plannedAmount float64
+			var actualAmount *float64
+			var decayPerWeek *float64
+			var decayStartDate *time.Time
+			if err := rows.Scan(&plannedAmount, &actualAmount, &decayPerWeek, &decayStartDate); err != nil {
+				rows.Close()
+				return 0, false, err
+			}
+			balance -= effectiveEntryAmount(plannedAmount, actualAmount, decayPerWeek, decayStartDate)
+		}
+		rows.Close()
+	}
+
+	purchaseRows, err := database.Query(`
+		SELECT amount FROM card_purchases WHERE credit_card_id = $1 AND purchase_date > $2`,
+		cardID, checkpointDate)
+	if err != nil {
+		return 0, false, err
+	}
+	defer purchaseRows.Close()
+	for purchaseRows.Next() {
+		var amount float64
+		if err := purchaseRows.Scan(&amount); err != nil {
+			return 0, false, err
+		}
+		balance += amount
+	}
+	return balance, true, nil
 }
 
 // recalculateCheckpointPeriod recalculates the payment-period entry that a

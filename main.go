@@ -683,6 +683,32 @@ func main() {
 		writeJSON(w, http.StatusOK, breakdown)
 	})
 
+	// GET /card-current-balance?credit_card_id=N returns this card's
+	// best-estimate running balance right now -- see db.CurrentCardBalance.
+	// Intended for carries_balance cards, where (unlike a pay-in-full card)
+	// the period payment amount no longer tracks the real balance owed.
+	http.HandleFunc("/card-current-balance", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		cardID, ok := intQueryParam(r, "credit_card_id")
+		if !ok {
+			writeError(w, http.StatusBadRequest, "credit_card_id required")
+			return
+		}
+		balance, found, err := db.CurrentCardBalance(int64(cardID))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"credit_card_id": cardID,
+			"balance":        balance,
+			"found":          found,
+		})
+	})
+
 	// GET /checkpoints lists every known-good balance recorded so far.
 	// POST /checkpoints adds (or replaces, if the period already has one)
 	// a checkpoint -- e.g. after checking the real bank app -- which
