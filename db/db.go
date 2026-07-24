@@ -244,11 +244,47 @@ func UpdateCreditCard(id int64, c CreditCard) error {
 	if c.PaymentDueMonthOffset == 0 {
 		c.PaymentDueMonthOffset = 1
 	}
+
+	var oldCarriesBalance bool
+	_ = database.QueryRow(`SELECT carries_balance FROM credit_cards WHERE id=$1`, id).Scan(&oldCarriesBalance)
+
 	_, err := database.Exec(
 		`UPDATE credit_cards SET name=$2, statement_day=$3, payment_due_day=$4, payment_due_month_offset=$5, carries_balance=$6 WHERE id=$1`,
 		id, c.Name, c.StatementDay, c.PaymentDueDay, c.PaymentDueMonthOffset, c.CarriesBalance,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// carries_balance flips which calculation recalculateCardEntry uses (see
+	// sumPurchasesForPeriod), but planned_amount is a stored column only that
+	// function writes -- an already-materialized future period won't pick up
+	// the new model on its own until something else triggers a recalc. Force
+	// it immediately so the switch takes effect right away, not just for
+	// periods generated from here on.
+	if c.CarriesBalance != oldCarriesBalance {
+		if item, found, ferr := recurringItemForCard(id); ferr == nil && found {
+			rows, rerr := database.Query(`
+				SELECT DISTINCT period_year, period_month FROM entries
+				WHERE recurring_item_id = $1 AND actual_amount IS NULL`, item.id)
+			if rerr == nil {
+				type period struct{ year, month int }
+				var periods []period
+				for rows.Next() {
+					var p period
+					if rows.Scan(&p.year, &p.month) == nil {
+						periods = append(periods, p)
+					}
+				}
+				rows.Close()
+				for _, p := range periods {
+					_ = recalculateCardEntry(id, p.year, p.month)
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // ---- Card purchases ----
