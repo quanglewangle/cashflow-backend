@@ -86,18 +86,26 @@ type RecurringCardPurchase struct {
 }
 
 type RecurringItem struct {
-	ID            int64      `json:"id"`
-	CategoryID    int64      `json:"category_id"`
-	Name          string     `json:"name"`
-	ItemType      string     `json:"item_type"`
-	Frequency     string     `json:"frequency"` // monthly | three_monthly | annual | irregular | four_weekly
-	DefaultAmount *float64   `json:"default_amount"`
-	DueDay        *int       `json:"due_day"`
-	TargetMonth   *int       `json:"target_month"`
-	AnchorDate    *string    `json:"anchor_date"` // ISO date "YYYY-MM-DD"; monthly: don't generate before this month; four_weekly: reference occurrence
-	CreditCardID  *int64     `json:"credit_card_id"`
-	Active        bool       `json:"active"`
-	Notes         *string    `json:"notes"`
+	ID            int64    `json:"id"`
+	CategoryID    int64    `json:"category_id"`
+	Name          string   `json:"name"`
+	ItemType      string   `json:"item_type"`
+	Frequency     string   `json:"frequency"` // monthly | three_monthly | annual | irregular | four_weekly
+	DefaultAmount *float64 `json:"default_amount"`
+	DueDay        *int     `json:"due_day"`
+	TargetMonth   *int     `json:"target_month"`
+	AnchorDate    *string  `json:"anchor_date"` // ISO date "YYYY-MM-DD"; monthly: don't generate before this month; four_weekly: reference occurrence
+	CreditCardID  *int64   `json:"credit_card_id"`
+	Active        bool     `json:"active"`
+	Notes         *string  `json:"notes"`
+	// SundriesAmount/SundriesDecayPerWeek: for a card-linked monthly item,
+	// having both set makes GeneratePeriodEntries auto-create a decaying
+	// one-off "sundries" buffer (see migration 016) for this card, tagged to
+	// this period, alongside the item's own entry -- the automatic version
+	// of the manual workflow described in the user manual. Nil (the default)
+	// means don't auto-generate one; the manual workflow is unaffected.
+	SundriesAmount       *float64 `json:"sundries_amount"`
+	SundriesDecayPerWeek *float64 `json:"sundries_decay_per_week"`
 }
 
 type Entry struct {
@@ -115,6 +123,10 @@ type Entry struct {
 	DueDay          *int       `json:"due_day"`
 	DecayPerWeek    *float64   `json:"decay_per_week"`
 	DecayStartDate  *time.Time `json:"decay_start_date"`
+	// AutoSundries is true for a decaying one-off buffer GeneratePeriodEntries
+	// created automatically from a recurring item's sundries_amount, rather
+	// than one added by hand (see migration 016).
+	AutoSundries bool `json:"auto_sundries"`
 	// IncurredDate is when this entry's status last became incurred -- only
 	// populated by queries that need it (see sumUnpaidPriorCardBills), not
 	// exposed to the client.
@@ -638,11 +650,11 @@ type CardPaymentBreakdown struct {
 	Checkpoint          *CardCheckpoint `json:"checkpoint"`
 	CoveredByCheckpoint []CardPurchase  `json:"covered_by_checkpoint"`
 	Purchases           []CardPurchase  `json:"purchases"`
-	OneOffs             []Entry         `json:"one_offs"`              // card-tagged one-offs added on top (e.g. a sundries buffer)
-	UnpaidPriorBill     *Entry          `json:"unpaid_prior_bill"`     // netted out -- see sumUnpaidPriorCardBills
-	DefaultAmountUsed   *float64        `json:"default_amount_used"`   // set when no checkpoint/purchase exists yet and the recurring item's flat default was used instead -- see recalculateCardEntry
-	EntryID             *int64          `json:"entry_id"`              // the card's own generated entry for this period, for editing it directly
-	ManuallySet         bool            `json:"manually_set"`          // true if EntryID's amount is a what-if override -- see recalculateCardEntry
+	OneOffs             []Entry         `json:"one_offs"`            // card-tagged one-offs added on top (e.g. a sundries buffer)
+	UnpaidPriorBill     *Entry          `json:"unpaid_prior_bill"`   // netted out -- see sumUnpaidPriorCardBills
+	DefaultAmountUsed   *float64        `json:"default_amount_used"` // set when no checkpoint/purchase exists yet and the recurring item's flat default was used instead -- see recalculateCardEntry
+	EntryID             *int64          `json:"entry_id"`            // the card's own generated entry for this period, for editing it directly
+	ManuallySet         bool            `json:"manually_set"`        // true if EntryID's amount is a what-if override -- see recalculateCardEntry
 	Total               float64         `json:"total"`
 }
 
@@ -910,7 +922,8 @@ func DeleteCardPurchase(id int64) error {
 func GetRecurringItems() ([]RecurringItem, error) {
 	rows, err := database.Query(`
 		SELECT id, category_id, name, item_type, frequency, default_amount,
-		       due_day, target_month, anchor_date::text, credit_card_id, active, notes
+		       due_day, target_month, anchor_date::text, credit_card_id, active, notes,
+		       sundries_amount, sundries_decay_per_week
 		FROM recurring_items ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -920,7 +933,8 @@ func GetRecurringItems() ([]RecurringItem, error) {
 	for rows.Next() {
 		var r RecurringItem
 		if err := rows.Scan(&r.ID, &r.CategoryID, &r.Name, &r.ItemType, &r.Frequency,
-			&r.DefaultAmount, &r.DueDay, &r.TargetMonth, &r.AnchorDate, &r.CreditCardID, &r.Active, &r.Notes); err != nil {
+			&r.DefaultAmount, &r.DueDay, &r.TargetMonth, &r.AnchorDate, &r.CreditCardID, &r.Active, &r.Notes,
+			&r.SundriesAmount, &r.SundriesDecayPerWeek); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -932,10 +946,11 @@ func AddRecurringItem(r RecurringItem) (int64, error) {
 	var id int64
 	err := database.QueryRow(`
 		INSERT INTO recurring_items
-			(category_id, name, item_type, frequency, default_amount, due_day, target_month, anchor_date, credit_card_id, active, notes)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+			(category_id, name, item_type, frequency, default_amount, due_day, target_month, anchor_date, credit_card_id, active, notes, sundries_amount, sundries_decay_per_week)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
 		r.CategoryID, r.Name, r.ItemType, r.Frequency, r.DefaultAmount,
 		r.DueDay, r.TargetMonth, r.AnchorDate, r.CreditCardID, r.Active, r.Notes,
+		r.SundriesAmount, r.SundriesDecayPerWeek,
 	).Scan(&id)
 	return id, err
 }
@@ -950,10 +965,12 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 	_, err := database.Exec(`
 		UPDATE recurring_items SET
 			category_id=$2, name=$3, item_type=$4, frequency=$5, default_amount=$6,
-			due_day=$7, target_month=$8, anchor_date=$9, credit_card_id=$10, active=$11, notes=$12
+			due_day=$7, target_month=$8, anchor_date=$9, credit_card_id=$10, active=$11, notes=$12,
+			sundries_amount=$13, sundries_decay_per_week=$14
 		WHERE id=$1`,
 		id, r.CategoryID, r.Name, r.ItemType, r.Frequency, r.DefaultAmount,
 		r.DueDay, r.TargetMonth, r.AnchorDate, r.CreditCardID, r.Active, r.Notes,
+		r.SundriesAmount, r.SundriesDecayPerWeek,
 	)
 	if err != nil {
 		return err
@@ -1044,7 +1061,7 @@ func GetEntries(year, month int) ([]Entry, error) {
 	rows, err := database.Query(`
 		SELECT id, recurring_item_id, category_id, period_year, period_month,
 		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day,
-		       decay_per_week, decay_start_date
+		       decay_per_week, decay_start_date, auto_sundries
 		FROM entries WHERE period_year=$1 AND period_month=$2 ORDER BY due_day NULLS LAST, id`, year, month)
 	if err != nil {
 		return nil, err
@@ -1055,7 +1072,7 @@ func GetEntries(year, month int) ([]Entry, error) {
 		var e Entry
 		if err := rows.Scan(&e.ID, &e.RecurringItemID, &e.CategoryID, &e.PeriodYear, &e.PeriodMonth,
 			&e.Name, &e.ItemType, &e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID, &e.DueDay,
-			&e.DecayPerWeek, &e.DecayStartDate); err != nil {
+			&e.DecayPerWeek, &e.DecayStartDate, &e.AutoSundries); err != nil {
 			return nil, err
 		}
 		e.EffectiveAmount = effectiveEntryAmount(e.PlannedAmount, e.ActualAmount, e.DecayPerWeek, e.DecayStartDate)
@@ -1248,7 +1265,8 @@ func DeleteEntry(id int64) error {
 //   - irregular items: never auto-generated; added ad-hoc via AddEntry.
 func GeneratePeriodEntries(year, month int) (int, error) {
 	rows, err := database.Query(`
-		SELECT id, category_id, name, item_type, frequency, default_amount, anchor_date, credit_card_id, due_day
+		SELECT id, category_id, name, item_type, frequency, default_amount, anchor_date, credit_card_id, due_day,
+		       sundries_amount, sundries_decay_per_week
 		FROM recurring_items
 		WHERE active = TRUE
 		  AND (
@@ -1270,20 +1288,23 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 	defer rows.Close()
 
 	type tmpl struct {
-		id            int64
-		categoryID    int64
-		name          string
-		itemType      string
-		frequency     string
-		defaultAmount *float64
-		anchorDate    *time.Time
-		creditCardID  *int64
-		dueDay        *int
+		id                   int64
+		categoryID           int64
+		name                 string
+		itemType             string
+		frequency            string
+		defaultAmount        *float64
+		anchorDate           *time.Time
+		creditCardID         *int64
+		dueDay               *int
+		sundriesAmount       *float64
+		sundriesDecayPerWeek *float64
 	}
 	var templates []tmpl
 	for rows.Next() {
 		var t tmpl
-		if err := rows.Scan(&t.id, &t.categoryID, &t.name, &t.itemType, &t.frequency, &t.defaultAmount, &t.anchorDate, &t.creditCardID, &t.dueDay); err != nil {
+		if err := rows.Scan(&t.id, &t.categoryID, &t.name, &t.itemType, &t.frequency, &t.defaultAmount, &t.anchorDate, &t.creditCardID, &t.dueDay,
+			&t.sundriesAmount, &t.sundriesDecayPerWeek); err != nil {
 			return 0, err
 		}
 		templates = append(templates, t)
@@ -1338,6 +1359,34 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 				*dueDay, t.id, year, month,
 			); err != nil {
 				return created, err
+			}
+		}
+
+		// A card-linked item with sundries_amount set auto-generates its own
+		// decaying one-off buffer for this period too (see migration 016) --
+		// the automatic version of the "add a decaying sundries entry" workflow
+		// described in the user manual, for cards whose default_amount was
+		// deliberately zeroed in favour of this buffer. auto_sundries's partial
+		// unique index keeps this idempotent across repeat calls; ON CONFLICT DO
+		// NOTHING means recalculateCardEntry only needs to run when a new buffer
+		// was actually inserted, not one already sitting there decaying.
+		if t.creditCardID != nil && t.sundriesAmount != nil {
+			decayStart := time.Now().Truncate(24 * time.Hour)
+			var newID int64
+			err := database.QueryRow(`
+				INSERT INTO entries (category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id, decay_per_week, decay_start_date, auto_sundries)
+				VALUES ($1,$2,$3,$4,'expense',$5,$6,$7,$8,TRUE)
+				ON CONFLICT (credit_card_id, period_year, period_month) WHERE auto_sundries DO NOTHING
+				RETURNING id`,
+				t.categoryID, year, month, t.name+" sundries", *t.sundriesAmount, *t.creditCardID, t.sundriesDecayPerWeek, decayStart,
+			).Scan(&newID)
+			if err != nil && err != sql.ErrNoRows {
+				return created, err
+			}
+			if err == nil {
+				if err := recalculateCardEntry(*t.creditCardID, year, month); err != nil {
+					return created, err
+				}
 			}
 		}
 	}
@@ -1627,7 +1676,7 @@ func GetCardTaggedOneOffs(cardID int64, year, month int) ([]Entry, error) {
 	rows, err := database.Query(`
 		SELECT id, recurring_item_id, category_id, period_year, period_month,
 		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day,
-		       decay_per_week, decay_start_date
+		       decay_per_week, decay_start_date, auto_sundries
 		FROM entries WHERE credit_card_id = $1 AND recurring_item_id IS NULL
 		AND period_year = $2 AND period_month = $3
 		ORDER BY due_day NULLS LAST, id`, cardID, year, month)
@@ -1640,7 +1689,7 @@ func GetCardTaggedOneOffs(cardID int64, year, month int) ([]Entry, error) {
 		var e Entry
 		if err := rows.Scan(&e.ID, &e.RecurringItemID, &e.CategoryID, &e.PeriodYear, &e.PeriodMonth,
 			&e.Name, &e.ItemType, &e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID, &e.DueDay,
-			&e.DecayPerWeek, &e.DecayStartDate); err != nil {
+			&e.DecayPerWeek, &e.DecayStartDate, &e.AutoSundries); err != nil {
 			return nil, err
 		}
 		e.EffectiveAmount = effectiveEntryAmount(e.PlannedAmount, e.ActualAmount, e.DecayPerWeek, e.DecayStartDate)
@@ -1936,8 +1985,8 @@ type ForecastDanger struct {
 	PeriodYear     int     `json:"period_year"`
 	PeriodMonth    int     `json:"period_month"`
 	BroughtForward float64 `json:"brought_forward"`
-	MinBalance     float64 `json:"min_balance"`      // lowest intra-month running balance
-	MinBalanceDay  int     `json:"min_balance_day"`  // day of month when minimum occurs
+	MinBalance     float64 `json:"min_balance"`     // lowest intra-month running balance
+	MinBalanceDay  int     `json:"min_balance_day"` // day of month when minimum occurs
 	CarriedForward float64 `json:"carried_forward"`
 }
 

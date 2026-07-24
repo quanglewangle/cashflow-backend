@@ -29,6 +29,12 @@ INSERT INTO recurring_items (category_id, name, item_type, frequency, default_am
     (2, 'Jack & Archie',        'expense', 'monthly',  60.00, NULL, NULL, TRUE),
     (2, 'Jenny''s card',        'expense', 'monthly',   0.00, 19, 3,    TRUE);
 
+-- Visacard and Jenny's card use the decaying-buffer model instead of a flat
+-- default_amount (see migration 016) -- without these, a period with no
+-- purchases logged yet (e.g. a future month) would estimate £0.
+UPDATE recurring_items SET sundries_amount = 600.00, sundries_decay_per_week = 150.00 WHERE name = 'Visacard';
+UPDATE recurring_items SET sundries_amount = 500.00, sundries_decay_per_week = 125.00 WHERE name = 'Jenny''s card';
+
 -- From the sheet's "unusual payments" list: only "car" was confirmed as a
 -- genuine annual cost (it landed in the July column -> target_month=7).
 -- The rest (gudun, jenny's card lump payment, splashback, Trevor, vet,
