@@ -27,7 +27,7 @@ INSERT INTO recurring_items (category_id, name, item_type, frequency, default_am
     (2, 'Barclaycard',          'expense', 'monthly', 170.00, 19, 2,    TRUE),
     (2, 'repay Marcus',         'expense', 'monthly', 500.00, NULL, NULL, TRUE),
     (2, 'Jack & Archie',        'expense', 'monthly',  60.00, NULL, NULL, TRUE),
-    (2, 'Jenny''s card',        'expense', 'monthly', 500.00, 19, 3,    TRUE);
+    (2, 'Jenny''s card',        'expense', 'monthly',   0.00, 19, 3,    TRUE);
 
 -- From the sheet's "unusual payments" list: only "car" was confirmed as a
 -- genuine annual cost (it landed in the July column -> target_month=7).
