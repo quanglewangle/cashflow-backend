@@ -2097,6 +2097,22 @@ type ForecastDanger struct {
 	MinBalance     float64 `json:"min_balance"`     // lowest intra-month running balance
 	MinBalanceDay  int     `json:"min_balance_day"` // day of month when minimum occurs
 	CarriedForward float64 `json:"carried_forward"`
+	// LowDays/LowOngoing describe the below-£0 streak containing MinBalanceDay
+	// (which can span months either side of this one) -- see ForecastDangerRange.
+	// LowDays is 0 when MinBalance >= 0. LowOngoing means the streak hadn't
+	// recovered within the lookahead window, so LowDays is a lower bound.
+	LowDays    int  `json:"low_days"`
+	LowOngoing bool `json:"low_ongoing"`
+}
+
+// dayBalance is one point in a period's running-balance trace -- the
+// balance immediately after processing the entry due on that day. Used to
+// detect below-£0 streaks that may span multiple months (see
+// ForecastDangerRange), since the min/carried values alone don't preserve
+// enough of the walk to find where a streak starts or ends.
+type dayBalance struct {
+	day     int
+	balance float64
 }
 
 // periodMinBalance walks entries in (year, month) from startBalance and
@@ -2112,7 +2128,11 @@ type ForecastDanger struct {
 // entry from fromDay onward still gets summed either way, so carried (the
 // period's true closing balance, chained into next period's brought-forward)
 // is unaffected by where tracking starts.
-func periodMinBalance(year, month, fromDay, trackMinFromDay int, startBalance float64) (minBalance float64, minDay int, carried float64, err error) {
+//
+// trace is every entry's (day, balance-after) point in day order, for the
+// full fromDay-onward walk regardless of trackMinFromDay -- callers that
+// only need min/carried can ignore it.
+func periodMinBalance(year, month, fromDay, trackMinFromDay int, startBalance float64) (minBalance float64, minDay int, carried float64, trace []dayBalance, err error) {
 	if _, err = GeneratePeriodEntries(year, month); err != nil {
 		return
 	}
@@ -2167,6 +2187,7 @@ func periodMinBalance(year, month, fromDay, trackMinFromDay int, startBalance fl
 		} else {
 			balance -= amount
 		}
+		trace = append(trace, dayBalance{day: day, balance: balance})
 		if !tracking && day >= trackMinFromDay {
 			tracking = true
 			minBalance = balance
@@ -2217,8 +2238,19 @@ func ForecastDangerRange(fromYear, fromMonth, count int) ([]ForecastDanger, erro
 	now := time.Now()
 	todayYear, todayMonth, todayDay := now.Year(), int(now.Month()), now.Day()
 
-	out := make([]ForecastDanger, 0, count)
-	for i := 0; i < count; i++ {
+	// Walk twice the requested range -- the extra months are lookahead only,
+	// used to find where a below-£0 streak still open at the end of the
+	// requested window eventually recovers (or give up and report it as
+	// ongoing). They're never returned as rows themselves.
+	type monthResult struct {
+		year, month         int
+		bf, minBal, carried float64
+		minDay              int
+		trace               []dayBalance
+	}
+	total := count * 2
+	results := make([]monthResult, 0, total)
+	for i := 0; i < total; i++ {
 		bf := balance
 		// For the checkpoint's own month, start from the checkpoint balance and
 		// only walk entries from the checkpoint day forward — past entries are
@@ -2235,19 +2267,75 @@ func ForecastDangerRange(fromYear, fromMonth, count int) ([]ForecastDanger, erro
 		if y == todayYear && m == todayMonth && todayDay > trackMinFromDay {
 			trackMinFromDay = todayDay
 		}
-		minBal, minDay, carried, err := periodMinBalance(y, m, fromDay, trackMinFromDay, startBal)
+		minBal, minDay, carried, trace, err := periodMinBalance(y, m, fromDay, trackMinFromDay, startBal)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, ForecastDanger{
-			PeriodYear: y, PeriodMonth: m,
-			BroughtForward: bf,
-			MinBalance:     minBal,
-			MinBalanceDay:  minDay,
-			CarriedForward: carried,
-		})
+		results = append(results, monthResult{year: y, month: m, bf: bf, minBal: minBal, carried: carried, minDay: minDay, trace: trace})
 		balance = carried
 		y, m = nextPeriod(y, m)
+	}
+
+	// Single continuous walk across every month's trace to find each
+	// below-£0 streak's start/end -- a dip can span months, so this can't be
+	// derived independently per month the way MinBalance is.
+	type lowStreak struct {
+		start, end time.Time
+		ongoing    bool
+	}
+	var streaks []lowStreak
+	var belowSince *time.Time
+	var lastDate time.Time
+	for _, r := range results {
+		for _, pt := range r.trace {
+			day := pt.day
+			if day == 0 {
+				day = 1
+			}
+			date := time.Date(r.year, time.Month(r.month), day, 0, 0, 0, 0, time.UTC)
+			lastDate = date
+			if pt.balance < 0 {
+				if belowSince == nil {
+					d := date
+					belowSince = &d
+				}
+			} else if belowSince != nil {
+				streaks = append(streaks, lowStreak{start: *belowSince, end: date})
+				belowSince = nil
+			}
+		}
+	}
+	if belowSince != nil {
+		streaks = append(streaks, lowStreak{start: *belowSince, end: lastDate, ongoing: true})
+	}
+
+	out := make([]ForecastDanger, 0, count)
+	for _, r := range results[:count] {
+		fd := ForecastDanger{
+			PeriodYear: r.year, PeriodMonth: r.month,
+			BroughtForward: r.bf,
+			MinBalance:     r.minBal,
+			MinBalanceDay:  r.minDay,
+			CarriedForward: r.carried,
+		}
+		if r.minBal < 0 {
+			day := r.minDay
+			if day == 0 {
+				day = 1
+			}
+			minDate := time.Date(r.year, time.Month(r.month), day, 0, 0, 0, 0, time.UTC)
+			for _, s := range streaks {
+				// Day-granularity means the streak's minimum and its recovery
+				// can land on the same calendar date (multiple entries due the
+				// same day) -- end must be an inclusive bound, not exclusive.
+				if !minDate.Before(s.start) && !minDate.After(s.end) {
+					fd.LowDays = int(s.end.Sub(s.start).Hours() / 24)
+					fd.LowOngoing = s.ongoing
+					break
+				}
+			}
+		}
+		out = append(out, fd)
 	}
 	return out, nil
 }
