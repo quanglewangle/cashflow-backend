@@ -1370,22 +1370,40 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		// unique index keeps this idempotent across repeat calls; ON CONFLICT DO
 		// NOTHING means recalculateCardEntry only needs to run when a new buffer
 		// was actually inserted, not one already sitting there decaying.
+		//
+		// Skipped entirely when a checkpoint already anchors this exact period --
+		// the buffer exists to estimate a period nothing's been confirmed for
+		// yet, not to pad a real, recently-recorded balance. Adding it on top of
+		// a checkpoint double-counts (see cashflow issue: Jenny's card showing
+		// £914 for a known £444 August bill -- checkpoint £414 + a full undecayed
+		// £500 buffer neither the checkpoint nor the buffer's own design ever
+		// intended to stack).
 		if t.creditCardID != nil && t.sundriesAmount != nil {
-			decayStart := time.Now().Truncate(24 * time.Hour)
-			var newID int64
-			err := database.QueryRow(`
-				INSERT INTO entries (category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id, decay_per_week, decay_start_date, auto_sundries)
-				VALUES ($1,$2,$3,$4,'expense',$5,$6,$7,$8,TRUE)
-				ON CONFLICT (credit_card_id, period_year, period_month) WHERE auto_sundries DO NOTHING
-				RETURNING id`,
-				t.categoryID, year, month, t.name+" sundries", *t.sundriesAmount, *t.creditCardID, t.sundriesDecayPerWeek, decayStart,
-			).Scan(&newID)
-			if err != nil && err != sql.ErrNoRows {
-				return created, err
+			card, cerr := getCreditCard(*t.creditCardID)
+			if cerr != nil {
+				return created, cerr
 			}
-			if err == nil {
-				if err := recalculateCardEntry(*t.creditCardID, year, month); err != nil {
+			_, hasCheckpoint, cerr := latestCardCheckpointForPeriod(card, year, month)
+			if cerr != nil {
+				return created, cerr
+			}
+			if !hasCheckpoint {
+				decayStart := time.Now().Truncate(24 * time.Hour)
+				var newID int64
+				err := database.QueryRow(`
+					INSERT INTO entries (category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id, decay_per_week, decay_start_date, auto_sundries)
+					VALUES ($1,$2,$3,$4,'expense',$5,$6,$7,$8,TRUE)
+					ON CONFLICT (credit_card_id, period_year, period_month) WHERE auto_sundries DO NOTHING
+					RETURNING id`,
+					t.categoryID, year, month, t.name+" sundries", *t.sundriesAmount, *t.creditCardID, t.sundriesDecayPerWeek, decayStart,
+				).Scan(&newID)
+				if err != nil && err != sql.ErrNoRows {
 					return created, err
+				}
+				if err == nil {
+					if err := recalculateCardEntry(*t.creditCardID, year, month); err != nil {
+						return created, err
+					}
 				}
 			}
 		}
