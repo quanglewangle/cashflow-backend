@@ -426,7 +426,7 @@ func recalculateCardEntry(cardID int64, year, month int) error {
 	_, err = database.Exec(`
 		INSERT INTO entries (recurring_item_id, category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-		ON CONFLICT (recurring_item_id, period_year, period_month) DO UPDATE SET planned_amount = $7`,
+		ON CONFLICT (recurring_item_id, period_year, period_month, occurrence_seq) DO UPDATE SET planned_amount = $7`,
 		item.id, item.categoryID, year, month, item.name, item.itemType, total, cardID,
 	)
 	return err
