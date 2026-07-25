@@ -1343,6 +1343,36 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		templates = append(templates, t)
 	}
 
+	// insertGeneratedEntry inserts (idempotently, via occurrence_seq alongside
+	// the usual recurring_item_id/period key) one occurrence of a template's
+	// entry for (year, month) and backfills due_day on it if it already
+	// existed without one. occurrence_seq is always 0 except for a
+	// four_weekly item's second-or-later occurrence within the same month.
+	insertGeneratedEntry := func(t tmpl, occurrenceSeq int, amount float64, dueDay *int) (created int, err error) {
+		res, err := database.Exec(`
+			INSERT INTO entries (recurring_item_id, category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id, due_day, occurrence_seq)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+			ON CONFLICT (recurring_item_id, period_year, period_month, occurrence_seq) DO NOTHING`,
+			t.id, t.categoryID, year, month, t.name, t.itemType, amount, t.creditCardID, dueDay, occurrenceSeq,
+		)
+		if err != nil {
+			return 0, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			created = 1
+		}
+		if dueDay != nil {
+			if _, err := database.Exec(`
+				UPDATE entries SET due_day = $1
+				WHERE recurring_item_id = $2 AND period_year = $3 AND period_month = $4 AND occurrence_seq = $5 AND due_day IS NULL`,
+				*dueDay, t.id, year, month, occurrenceSeq,
+			); err != nil {
+				return created, err
+			}
+		}
+		return created, nil
+	}
+
 	created := 0
 	for _, t := range templates {
 		amount := 0.0
@@ -1355,44 +1385,34 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 			day := lastWorkingDayOfMonth(year, month)
 			dueDay = &day
 		}
-		if t.frequency == "four_weekly" {
-			occurrences := fourWeeklyOccurrences(*t.anchorDate, year, month)
-			if occurrences == 0 {
-				continue // this cycle's 28-day drift means not every month gets one
-			}
-			amount *= float64(occurrences)
-			day := fourWeeklyFirstDay(*t.anchorDate, year, month)
-			if day > 0 {
-				dueDay = &day
-			}
-		}
 		if t.frequency == "three_monthly" {
 			if t.anchorDate == nil || !threeMonthlyFires(*t.anchorDate, year, month) {
 				continue
 			}
 		}
 
-		res, err := database.Exec(`
-			INSERT INTO entries (recurring_item_id, category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id, due_day)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-			ON CONFLICT (recurring_item_id, period_year, period_month) DO NOTHING`,
-			t.id, t.categoryID, year, month, t.name, t.itemType, amount, t.creditCardID, dueDay,
-		)
-		if err != nil {
-			return created, err
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			created++
-		}
-		// Backfill due_day on existing entries that were generated without one.
-		if dueDay != nil {
-			if _, err := database.Exec(`
-				UPDATE entries SET due_day = $1
-				WHERE recurring_item_id = $2 AND period_year = $3 AND period_month = $4 AND due_day IS NULL`,
-				*dueDay, t.id, year, month,
-			); err != nil {
+		if t.frequency == "four_weekly" {
+			// A 28-day cycle can land twice in one calendar month -- each
+			// occurrence gets its own entry (own day, own single-occurrence
+			// amount) instead of being merged into one inflated, single-day row.
+			days := fourWeeklyDaysInMonth(*t.anchorDate, year, month)
+			if len(days) == 0 {
+				continue // this cycle's 28-day drift means not every month gets one
+			}
+			for seq, day := range days {
+				d := day
+				n, err := insertGeneratedEntry(t, seq, amount, &d)
+				if err != nil {
+					return created, err
+				}
+				created += n
+			}
+		} else {
+			n, err := insertGeneratedEntry(t, 0, amount, dueDay)
+			if err != nil {
 				return created, err
 			}
+			created += n
 		}
 
 		// A card-linked item with sundries_amount set auto-generates its own
@@ -1550,14 +1570,16 @@ func threeMonthlyFires(anchor time.Time, year, month int) bool {
 	return diff >= 0 && diff%3 == 0
 }
 
-// fourWeeklyOccurrences counts how many anchor+28*k days (k=0,1,2,...) land
-// within calendar month (year, month). A 28-day cycle is ~13 occurrences a
-// year, not 12, so it drifts against calendar months: most months get
-// exactly one, occasionally one gets two (when the drift "catches up") or
-// none. The loop is bounded -- at most 31 days in a month / 28-day step
-// can ever produce more than 2 occurrences, so 4 iterations is generous,
-// not a risk of runaway (this codebase has already had one of those).
-func fourWeeklyOccurrences(anchor time.Time, year, month int) int {
+// fourWeeklyDaysInMonth returns the day-of-month of every anchor+28*k
+// occurrence (k=0,1,2,...) that lands within calendar month (year, month), in
+// order. A 28-day cycle is ~13 occurrences a year, not 12, so it drifts
+// against calendar months: most months get exactly one, occasionally one
+// gets two (when the drift "catches up") or none. The loop is bounded -- at
+// most 31 days in a month / 28-day step can ever produce more than 2
+// occurrences, so 4 iterations is generous, not a risk of runaway (this
+// codebase has already had one of those). Mirrors the Android client's own
+// Util.fourWeeklyDaysInMonth, used there for display purposes only.
+func fourWeeklyDaysInMonth(anchor time.Time, year, month int) []int {
 	monthStart := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
 	monthEnd := monthStart.AddDate(0, 1, 0)
 
@@ -1570,44 +1592,17 @@ func fourWeeklyOccurrences(anchor time.Time, year, month int) int {
 		k = 0
 	}
 
-	count := 0
+	var days []int
 	for i := 0; i < 4; i++ {
 		occ := anchor.AddDate(0, 0, 28*(k+i))
 		if !occ.Before(monthStart) && occ.Before(monthEnd) {
-			count++
+			days = append(days, occ.Day())
 		}
 		if !occ.Before(monthEnd) {
 			break
 		}
 	}
-	return count
-}
-
-// fourWeeklyFirstDay returns the day-of-month of the first four_weekly occurrence
-// in (year, month), or 0 if there is none.
-func fourWeeklyFirstDay(anchor time.Time, year, month int) int {
-	monthStart := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
-	monthEnd := monthStart.AddDate(0, 1, 0)
-
-	diffDays := int(monthStart.Sub(anchor).Hours() / 24)
-	k := diffDays / 28
-	if diffDays%28 != 0 && diffDays > 0 {
-		k++
-	}
-	if k < 0 {
-		k = 0
-	}
-
-	for i := 0; i < 4; i++ {
-		occ := anchor.AddDate(0, 0, 28*(k+i))
-		if occ.Before(monthEnd) && !occ.Before(monthStart) {
-			return occ.Day()
-		}
-		if !occ.Before(monthEnd) {
-			break
-		}
-	}
-	return 0
+	return days
 }
 
 // lastWorkingDayOfMonth returns the last Monday-Friday of the given month.

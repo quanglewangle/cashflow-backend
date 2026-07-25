@@ -33,7 +33,7 @@ func TestFourWeeklyOccurrences(t *testing.T) {
 	y, m := 2026, 1
 	twoOccurrenceMonths := 0
 	for i := 0; i < 12; i++ {
-		n := fourWeeklyOccurrences(anchor, y, m)
+		n := len(fourWeeklyDaysInMonth(anchor, y, m))
 		total += n
 		if n == 2 {
 			twoOccurrenceMonths++
@@ -55,7 +55,7 @@ func TestFourWeeklyOccurrences(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		got := fourWeeklyOccurrences(anchor, c.year, c.month)
+		got := len(fourWeeklyDaysInMonth(anchor, c.year, c.month))
 		if got != c.want {
 			t.Errorf("%d-%02d: got %d, want %d", c.year, c.month, got, c.want)
 		}
@@ -67,12 +67,12 @@ func TestFourWeeklyOccurrencesNoInfiniteLoop(t *testing.T) {
 	// and return 0 -- this is the exact class of bug that caused the
 	// production incident (unbounded forward generation).
 	anchor := date("2100-01-01")
-	if got := fourWeeklyOccurrences(anchor, 2026, 6); got != 0 {
+	if got := len(fourWeeklyDaysInMonth(anchor, 2026, 6)); got != 0 {
 		t.Errorf("anchor far in the future: got %d, want 0", got)
 	}
 
 	anchor2 := date("1990-01-01")
-	if got := fourWeeklyOccurrences(anchor2, 2026, 6); got < 0 || got > 2 {
+	if got := len(fourWeeklyDaysInMonth(anchor2, 2026, 6)); got < 0 || got > 2 {
 		t.Errorf("anchor far in the past: got %d, want 0-2", got)
 	}
 }
