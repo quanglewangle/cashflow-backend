@@ -610,6 +610,39 @@ func prevPeriod(year, month int) (int, int) {
 	return year, month
 }
 
+// windowEndForPeriod returns the statement-close date that determines
+// payment period (year, month) -- the latest date D for which
+// paymentPeriodFor(card, D) == (year, month). Used to pro-rate a card's
+// auto-sundries buffer against how much of that window a checkpoint has
+// already covered (see proRatedSundries).
+func windowEndForPeriod(card CreditCard, year, month int) time.Time {
+	y, m := year, month
+	for i := 0; i < card.PaymentDueMonthOffset; i++ {
+		y, m = prevPeriod(y, m)
+	}
+	return time.Date(y, time.Month(m), card.StatementDay, 0, 0, 0, 0, time.UTC)
+}
+
+// proRatedSundries sizes a card's auto-sundries buffer down to just the
+// remainder of its payment period's window still uncovered by a checkpoint --
+// a checkpoint only vouches for spending up to its own date, so only the
+// days between it and the window's close (the next statement cut) are still
+// "unlogged" and worth estimating. ok is false when the checkpoint is at or
+// after the window's close, meaning nothing's left to buffer at all (e.g. a
+// checkpoint dated exactly on the statement day).
+func proRatedSundries(card CreditCard, year, month int, decayPerWeek *float64, checkpointDate time.Time) (amount float64, decayStart time.Time, ok bool) {
+	windowEnd := windowEndForPeriod(card, year, month)
+	remainingDays := windowEnd.Sub(checkpointDate).Hours() / 24
+	if remainingDays <= 0 {
+		return 0, time.Time{}, false
+	}
+	weekly := 0.0
+	if decayPerWeek != nil {
+		weekly = *decayPerWeek
+	}
+	return weekly * (remainingDays / 7), checkpointDate, true
+}
+
 // latestCardCheckpointForPeriod finds the most recent checkpoint for this
 // card whose own date maps (via paymentPeriodFor, the same rule used for
 // purchases) to this same payment period -- i.e. it was taken partway
@@ -1371,31 +1404,45 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		// NOTHING means recalculateCardEntry only needs to run when a new buffer
 		// was actually inserted, not one already sitting there decaying.
 		//
-		// Skipped entirely when a checkpoint already anchors this exact period --
-		// the buffer exists to estimate a period nothing's been confirmed for
-		// yet, not to pad a real, recently-recorded balance. Adding it on top of
-		// a checkpoint double-counts (see cashflow issue: Jenny's card showing
-		// £914 for a known £444 August bill -- checkpoint £414 + a full undecayed
-		// £500 buffer neither the checkpoint nor the buffer's own design ever
-		// intended to stack).
+		// If a checkpoint already anchors this exact period, the buffer is
+		// pro-rated down to just the remainder of the window the checkpoint
+		// hasn't vouched for yet (see proRatedSundries) rather than either
+		// stacking the full amount on top of real data or being skipped
+		// outright -- a checkpoint only confirms spending up to its own date,
+		// so only the days after it until the next statement cut are still
+		// "unlogged" and worth estimating. skipInsert stays true (no buffer at
+		// all) only when the checkpoint is at or after the window's close.
 		if t.creditCardID != nil && t.sundriesAmount != nil {
 			card, cerr := getCreditCard(*t.creditCardID)
 			if cerr != nil {
 				return created, cerr
 			}
-			_, hasCheckpoint, cerr := latestCardCheckpointForPeriod(card, year, month)
+			amount := *t.sundriesAmount
+			decayStart := time.Now().Truncate(24 * time.Hour)
+			skipInsert := false
+
+			checkpoint, hasCheckpoint, cerr := latestCardCheckpointForPeriod(card, year, month)
 			if cerr != nil {
 				return created, cerr
 			}
-			if !hasCheckpoint {
-				decayStart := time.Now().Truncate(24 * time.Hour)
+			if hasCheckpoint {
+				checkpointDate := time.Date(checkpoint.PeriodYear, time.Month(checkpoint.PeriodMonth), checkpoint.PeriodDay, 0, 0, 0, 0, time.UTC)
+				proAmount, proStart, ok := proRatedSundries(card, year, month, t.sundriesDecayPerWeek, checkpointDate)
+				if !ok {
+					skipInsert = true
+				} else {
+					amount, decayStart = proAmount, proStart
+				}
+			}
+
+			if !skipInsert {
 				var newID int64
 				err := database.QueryRow(`
 					INSERT INTO entries (category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id, decay_per_week, decay_start_date, auto_sundries)
 					VALUES ($1,$2,$3,$4,'expense',$5,$6,$7,$8,TRUE)
 					ON CONFLICT (credit_card_id, period_year, period_month) WHERE auto_sundries DO NOTHING
 					RETURNING id`,
-					t.categoryID, year, month, t.name+" sundries", *t.sundriesAmount, *t.creditCardID, t.sundriesDecayPerWeek, decayStart,
+					t.categoryID, year, month, t.name+" sundries", amount, *t.creditCardID, t.sundriesDecayPerWeek, decayStart,
 				).Scan(&newID)
 				if err != nil && err != sql.ErrNoRows {
 					return created, err
@@ -1814,7 +1861,51 @@ func recalculateCheckpointPeriod(creditCardID int64, year, month, day int) error
 	}
 	checkpointDate := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
 	py, pm := paymentPeriodFor(card, checkpointDate)
+	if err := adjustAutoSundriesForCheckpoint(card, py, pm); err != nil {
+		return err
+	}
 	return recalculateCardEntry(creditCardID, py, pm)
+}
+
+// adjustAutoSundriesForCheckpoint re-sizes an already-generated auto-sundries
+// buffer (see GeneratePeriodEntries) for (year, month) when a checkpoint is
+// added, changed, or removed for that same period after the buffer was
+// created -- GeneratePeriodEntries only sizes it once, at creation, via its
+// ON CONFLICT DO NOTHING idempotency, so a checkpoint arriving later would
+// otherwise leave a stale, un-prorated buffer sitting on top of it. No-op if
+// this period never got an auto buffer in the first place; deletes it
+// outright if the checkpoint now covers the whole remaining window.
+func adjustAutoSundriesForCheckpoint(card CreditCard, year, month int) error {
+	var entryID int64
+	var decayPerWeek *float64
+	err := database.QueryRow(`
+		SELECT id, decay_per_week FROM entries
+		WHERE credit_card_id=$1 AND period_year=$2 AND period_month=$3 AND auto_sundries`,
+		card.ID, year, month,
+	).Scan(&entryID, &decayPerWeek)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	checkpoint, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
+	if err != nil {
+		return err
+	}
+	if !hasCheckpoint {
+		return nil // nothing to recompute against -- leave the buffer as-is
+	}
+	checkpointDate := time.Date(checkpoint.PeriodYear, time.Month(checkpoint.PeriodMonth), checkpoint.PeriodDay, 0, 0, 0, 0, time.UTC)
+	amount, decayStart, ok := proRatedSundries(card, year, month, decayPerWeek, checkpointDate)
+	if !ok {
+		_, err := database.Exec(`DELETE FROM entries WHERE id=$1`, entryID)
+		return err
+	}
+	_, err = database.Exec(`UPDATE entries SET planned_amount=$2, decay_start_date=$3 WHERE id=$1`,
+		entryID, amount, decayStart)
+	return err
 }
 
 // ---- Balance checkpoints ----
