@@ -516,39 +516,27 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 		}
 	}
 
-	// One-off entries deliberately tagged with this card (e.g. a decaying
-	// "sundries" contingency for anticipated-but-not-yet-logged spending) --
-	// added on top for the payment period the user gave them directly, no
-	// paymentPeriodFor translation needed since they're not dated purchases.
-	// periodNet/periodNetFrom exclude these from the general forecast so they
+	// Anything else tagged with this card -- true one-offs (e.g. a decaying
+	// "sundries" contingency for anticipated-but-not-yet-logged spending) as
+	// well as any other recurring item merely labelled with this card rather
+	// than being its own repayment template (see GetCardTaggedExtras) --
+	// added on top for the payment period directly, no paymentPeriodFor
+	// translation needed since these aren't dated purchases. periodNet/
+	// periodNetFrom exclude these from the general cash forecast so they
 	// aren't also counted as an independent line -- they're folded in here.
 	// Kept out of hasData/total deliberately: a lone one-off with no real
 	// checkpoint/purchase data for the period must still ADD ON TOP of the
 	// recurring item's flat default_amount fallback in recalculateCardEntry,
 	// never silently replace it.
-	oneOffRows, err := database.Query(`
-		SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date
-		FROM entries WHERE credit_card_id = $1 AND recurring_item_id IS NULL
-		AND period_year = $2 AND period_month = $3`, cardID, year, month)
+	extras, err := GetCardTaggedExtras(cardID, year, month)
 	if err != nil {
 		return 0, false, 0, err
 	}
-	defer oneOffRows.Close()
-
-	for oneOffRows.Next() {
-		var itemType string
-		var plannedAmount float64
-		var actualAmount *float64
-		var decayPerWeek *float64
-		var decayStartDate *time.Time
-		if err := oneOffRows.Scan(&itemType, &plannedAmount, &actualAmount, &decayPerWeek, &decayStartDate); err != nil {
-			return 0, false, 0, err
-		}
-		amount := effectiveEntryAmount(plannedAmount, actualAmount, decayPerWeek, decayStartDate)
-		if itemType == "income" {
-			oneOffTotal -= amount
+	for _, e := range extras {
+		if e.ItemType == "income" {
+			oneOffTotal -= e.EffectiveAmount
 		} else {
-			oneOffTotal += amount
+			oneOffTotal += e.EffectiveAmount
 		}
 	}
 	return total, hasData, oneOffTotal, nil
@@ -817,7 +805,7 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 		result.Total += subscriptionOnlyTotal
 	}
 
-	oneOffs, err := GetCardTaggedOneOffs(cardID, year, month)
+	oneOffs, err := GetCardTaggedExtras(cardID, year, month)
 	if err != nil {
 		return CardPaymentBreakdown{}, err
 	}
@@ -1189,16 +1177,33 @@ func UpdateEntry(id int64, e Entry) error {
 		return err
 	}
 
-	// One-off entries tagged with a card feed into that card's own repayment
-	// entry (see sumPurchasesForPeriod) -- recalculate whichever card(s) this
-	// edit affects, old and new, in case the tag was added, removed, or changed.
-	if oldRecurringItemID == nil && oldCreditCardID != nil {
-		if err := recalculateCardEntry(*oldCreditCardID, periodYear, periodMonth); err != nil {
+	// Anything tagged with a card other than that card's own designated
+	// repayment entry feeds into that card's bill (see GetCardTaggedExtras) --
+	// a true one-off, or another recurring item merely labelled with a card
+	// (e.g. a recurring purchase actually paid via it) rather than being the
+	// repayment template itself. Recalculate whichever card(s) this edit
+	// affects, old and new, in case the tag was added, removed, or changed.
+	// The repayment entry itself doesn't need this -- recalculateCardEntry
+	// keeps it in sync via its own upsert (see the block below instead).
+	recalcIfNotRepayment := func(cardID *int64, recurringItemID *int64) error {
+		if cardID == nil {
+			return nil
+		}
+		item, found, err := recurringItemForCard(*cardID)
+		if err != nil {
 			return err
 		}
+		if found && recurringItemID != nil && *recurringItemID == item.id {
+			return nil
+		}
+		return recalculateCardEntry(*cardID, periodYear, periodMonth)
 	}
-	if e.RecurringItemID == nil && e.CreditCardID != nil && (oldCreditCardID == nil || *oldCreditCardID != *e.CreditCardID) {
-		if err := recalculateCardEntry(*e.CreditCardID, periodYear, periodMonth); err != nil {
+	if err := recalcIfNotRepayment(oldCreditCardID, oldRecurringItemID); err != nil {
+		return err
+	}
+	if (oldCreditCardID == nil) != (e.CreditCardID == nil) ||
+		(oldCreditCardID != nil && e.CreditCardID != nil && *oldCreditCardID != *e.CreditCardID) {
+		if err := recalcIfNotRepayment(e.CreditCardID, e.RecurringItemID); err != nil {
 			return err
 		}
 	}
@@ -1758,6 +1763,47 @@ func GetCardTaggedOneOffs(cardID int64, year, month int) ([]Entry, error) {
 	return out, nil
 }
 
+// GetCardTaggedExtras returns every entry tagged with this card for the given
+// payment period that isn't that same card's own designated repayment entry
+// -- true one-offs (a decaying sundries buffer) as well as any other
+// recurring item merely labelled with this card (e.g. a recurring purchase
+// actually paid via it, like a quarterly vet-meds order) rather than being
+// the card's repayment template itself. This is the broadened set folded
+// into the card's own bill total (see sumPurchasesForPeriod,
+// GetCardPaymentBreakdown) -- deliberately not used for AddCardCheckpoint's
+// "these might be redundant now" hint, which must stay scoped to
+// GetCardTaggedOneOffs's narrower true-one-offs-only set.
+func GetCardTaggedExtras(cardID int64, year, month int) ([]Entry, error) {
+	rows, err := database.Query(`
+		SELECT id, recurring_item_id, category_id, period_year, period_month,
+		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day,
+		       decay_per_week, decay_start_date, auto_sundries
+		FROM entries WHERE credit_card_id = $1
+		AND (recurring_item_id IS NULL OR recurring_item_id IS DISTINCT FROM (
+			SELECT ri.id FROM recurring_items ri
+			WHERE ri.credit_card_id = $1 AND ri.frequency = 'monthly' AND ri.active = TRUE
+			ORDER BY ri.id LIMIT 1
+		))
+		AND period_year = $2 AND period_month = $3
+		ORDER BY due_day NULLS LAST, id`, cardID, year, month)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Entry
+	for rows.Next() {
+		var e Entry
+		if err := rows.Scan(&e.ID, &e.RecurringItemID, &e.CategoryID, &e.PeriodYear, &e.PeriodMonth,
+			&e.Name, &e.ItemType, &e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID, &e.DueDay,
+			&e.DecayPerWeek, &e.DecayStartDate, &e.AutoSundries); err != nil {
+			return nil, err
+		}
+		e.EffectiveAmount = effectiveEntryAmount(e.PlannedAmount, e.ActualAmount, e.DecayPerWeek, e.DecayStartDate)
+		out = append(out, e)
+	}
+	return out, nil
+}
+
 // DeleteCardCheckpoint removes a checkpoint, then recalculates the payment
 // period it used to anchor so that period falls back to summing its
 // purchases (or an earlier/no checkpoint) instead of keeping the stale total.
@@ -1974,23 +2020,41 @@ func periodNetFrom(year, month, fromDay int) (income, expense, savings float64, 
 		return 0, 0, 0, err
 	}
 
-	// One-off entries tagged with a credit card (recurring_item_id IS NULL,
-	// credit_card_id set) are folded into that card's own repayment entry by
-	// sumPurchasesForPeriod instead -- excluded here so they aren't also
-	// counted as an independent line.
+	// Any entry tagged with a credit card, other than that same card's own
+	// designated repayment item (found the same way recurringItemForCard
+	// does), is folded into that card's own bill by
+	// sumPurchasesForPeriod/GetCardTaggedExtras instead -- excluded here so
+	// it isn't also counted directly against cash. This is deliberately not
+	// just "recurring_item_id IS NULL" -- a recurring item can be tagged with
+	// a card purely as a label (e.g. a recurring purchase actually paid via
+	// that card) without being the card's own repayment template.
 	var rows *sql.Rows
 	if fromDay <= 1 {
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date
 			FROM entries WHERE period_year=$1 AND period_month=$2
-			AND (credit_card_id IS NULL OR recurring_item_id IS NOT NULL)`, year, month)
+			AND (
+				credit_card_id IS NULL
+				OR recurring_item_id = (
+					SELECT ri.id FROM recurring_items ri
+					WHERE ri.credit_card_id = entries.credit_card_id AND ri.frequency = 'monthly' AND ri.active = TRUE
+					ORDER BY ri.id LIMIT 1
+				)
+			)`, year, month)
 	} else {
 		// Exclude entries already incurred on the checkpoint day — they are baked
 		// into the checkpoint balance and must not be counted again.
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date
 			FROM entries WHERE period_year=$1 AND period_month=$2
-			AND (credit_card_id IS NULL OR recurring_item_id IS NOT NULL)
+			AND (
+				credit_card_id IS NULL
+				OR recurring_item_id = (
+					SELECT ri.id FROM recurring_items ri
+					WHERE ri.credit_card_id = entries.credit_card_id AND ri.frequency = 'monthly' AND ri.active = TRUE
+					ORDER BY ri.id LIMIT 1
+				)
+			)
 			AND (
 				due_day IS NULL
 				OR due_day > $3
@@ -2131,15 +2195,23 @@ func periodMinBalance(year, month, fromDay, trackMinFromDay int, startBalance fl
 	if _, err = GeneratePeriodEntries(year, month); err != nil {
 		return
 	}
-	// One-off entries tagged with a credit card are folded into that card's
-	// own repayment entry by sumPurchasesForPeriod instead -- excluded here,
+	// Any entry tagged with a credit card, other than that same card's own
+	// designated repayment item, is folded into that card's own bill by
+	// sumPurchasesForPeriod/GetCardTaggedExtras instead -- excluded here,
 	// same as periodNetFrom.
 	var rows *sql.Rows
 	if fromDay <= 1 {
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date, COALESCE(due_day, 0)
 			FROM entries WHERE period_year=$1 AND period_month=$2
-			AND (credit_card_id IS NULL OR recurring_item_id IS NOT NULL)
+			AND (
+				credit_card_id IS NULL
+				OR recurring_item_id = (
+					SELECT ri.id FROM recurring_items ri
+					WHERE ri.credit_card_id = entries.credit_card_id AND ri.frequency = 'monthly' AND ri.active = TRUE
+					ORDER BY ri.id LIMIT 1
+				)
+			)
 			ORDER BY COALESCE(due_day, 0)`, year, month)
 	} else {
 		// Exclude entries already incurred on the checkpoint day — they are baked
@@ -2148,7 +2220,14 @@ func periodMinBalance(year, month, fromDay, trackMinFromDay int, startBalance fl
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date, COALESCE(due_day, 0)
 			FROM entries WHERE period_year=$1 AND period_month=$2
-			AND (credit_card_id IS NULL OR recurring_item_id IS NOT NULL)
+			AND (
+				credit_card_id IS NULL
+				OR recurring_item_id = (
+					SELECT ri.id FROM recurring_items ri
+					WHERE ri.credit_card_id = entries.credit_card_id AND ri.frequency = 'monthly' AND ri.active = TRUE
+					ORDER BY ri.id LIMIT 1
+				)
+			)
 			AND (
 				due_day IS NULL
 				OR due_day > $3
