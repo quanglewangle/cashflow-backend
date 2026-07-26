@@ -1126,6 +1126,30 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 }
 
 func DeleteRecurringItem(id int64) error {
+	// Any planned entry tagged to a card gets folded into that card's bill
+	// total -- capture which (card, period) pairs are about to lose an entry
+	// so their stored totals can be refreshed after the delete.
+	rows, err := database.Query(`
+		SELECT DISTINCT credit_card_id, period_year, period_month
+		FROM entries WHERE recurring_item_id=$1 AND status='planned' AND credit_card_id IS NOT NULL`, id)
+	if err != nil {
+		return err
+	}
+	type cardPeriod struct {
+		cardID      int64
+		year, month int
+	}
+	var affected []cardPeriod
+	for rows.Next() {
+		var cp cardPeriod
+		if err := rows.Scan(&cp.cardID, &cp.year, &cp.month); err != nil {
+			rows.Close()
+			return err
+		}
+		affected = append(affected, cp)
+	}
+	rows.Close()
+
 	// Remove planned entries generated from this item; null out the FK on
 	// incurred ones so the historical record is kept but the item can be deleted.
 	if _, err := database.Exec(`DELETE FROM entries WHERE recurring_item_id=$1 AND status='planned'`, id); err != nil {
@@ -1134,8 +1158,16 @@ func DeleteRecurringItem(id int64) error {
 	if _, err := database.Exec(`UPDATE entries SET recurring_item_id=NULL WHERE recurring_item_id=$1`, id); err != nil {
 		return err
 	}
-	_, err := database.Exec(`DELETE FROM recurring_items WHERE id=$1`, id)
-	return err
+	if _, err := database.Exec(`DELETE FROM recurring_items WHERE id=$1`, id); err != nil {
+		return err
+	}
+
+	for _, cp := range affected {
+		if err := recalculateCardEntry(cp.cardID, cp.year, cp.month); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---- Entries ----
