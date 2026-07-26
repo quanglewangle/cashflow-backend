@@ -977,11 +977,13 @@ func AddRecurringItem(r RecurringItem) (int64, error) {
 }
 
 func UpdateRecurringItem(id int64, r RecurringItem) error {
-	// Read old default_amount so we can propagate a change to entries that still
-	// carry it as their planned_amount (i.e. the card entry has never had real
-	// purchases logged and is just showing the template estimate).
+	// Read old default_amount/credit_card_id so we can propagate a change to
+	// entries that still carry them (i.e. the entry has never had real
+	// purchases logged and is just showing the template estimate), and know
+	// whether a card tag was added, removed, or changed.
 	var oldAmount sql.NullFloat64
-	_ = database.QueryRow(`SELECT default_amount FROM recurring_items WHERE id=$1`, id).Scan(&oldAmount)
+	var oldCreditCardID *int64
+	_ = database.QueryRow(`SELECT default_amount, credit_card_id FROM recurring_items WHERE id=$1`, id).Scan(&oldAmount, &oldCreditCardID)
 
 	_, err := database.Exec(`
 		UPDATE recurring_items SET
@@ -1031,33 +1033,93 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 		}
 	}
 
-	if r.DefaultAmount != nil && oldAmount.Valid && *r.DefaultAmount != oldAmount.Float64 {
-		if r.CreditCardID != nil {
-			// Card-linked: recalculate each period so months with real purchases keep
-			// their purchase total and months with no purchases get the new default.
-			rows, err := database.Query(`
-				SELECT DISTINCT period_year, period_month FROM entries
-				WHERE recurring_item_id = $1 AND actual_amount IS NULL`, id)
-			if err == nil {
-				type period struct{ year, month int }
-				var periods []period
-				for rows.Next() {
-					var p period
-					if rows.Scan(&p.year, &p.month) == nil {
-						periods = append(periods, p)
-					}
-				}
-				rows.Close()
-				for _, p := range periods {
-					recalculateCardEntry(*r.CreditCardID, p.year, p.month)
+	// isCardRepaymentItem reports whether this template IS cardID's own
+	// designated repayment item (recurringItemForCard) -- as opposed to a
+	// recurring item merely labelled with a card, e.g. "Dog pills" tagged to
+	// Jenny's card. Only the former's own entries get recalculated via
+	// recalculateCardEntry (checkpoint/purchase-derived); the latter's own
+	// entries just carry their own default_amount directly.
+	isCardRepaymentItem := func(cardID int64) bool {
+		item, found, ferr := recurringItemForCard(cardID)
+		return ferr == nil && found && item.id == id
+	}
+
+	amountChanged := r.DefaultAmount != nil && oldAmount.Valid && *r.DefaultAmount != oldAmount.Float64
+	if amountChanged && (r.CreditCardID == nil || !isCardRepaymentItem(*r.CreditCardID)) {
+		// Not a card's own repayment item (including a plain non-card item) --
+		// its own entries just carry the template's own amount, no
+		// checkpoint/purchase math involved, so update them directly. This
+		// used to only happen for non-card items, leaving a card-tagged
+		// non-repayment item's own entries stuck at the old amount forever.
+		database.Exec(`
+			UPDATE entries SET planned_amount = $1
+			WHERE recurring_item_id = $2 AND actual_amount IS NULL`,
+			*r.DefaultAmount, id)
+	}
+
+	// Whenever this item is (or was) tagged with a card it doesn't itself
+	// represent the repayment for, that card's own stored bill total needs
+	// refreshing -- not just on an amount change, but due_day, active, or the
+	// card tag itself being added/removed/changed, any of which can add,
+	// remove, or move its contribution to that card's bill (see
+	// GetCardTaggedExtras). A card's own repayment item doesn't need this --
+	// its own entries are recalculated via recalculateCardEntry above/below
+	// (amount change) or already reflect due_day/item_type changes directly.
+	recalcCardIfNotRepayment := func(cardID *int64) error {
+		if cardID == nil || isCardRepaymentItem(*cardID) {
+			return nil
+		}
+		rows, err := database.Query(`
+			SELECT DISTINCT period_year, period_month FROM entries
+			WHERE recurring_item_id = $1 AND actual_amount IS NULL`, id)
+		if err != nil {
+			return err
+		}
+		type period struct{ year, month int }
+		var periods []period
+		for rows.Next() {
+			var p period
+			if rows.Scan(&p.year, &p.month) == nil {
+				periods = append(periods, p)
+			}
+		}
+		rows.Close()
+		for _, p := range periods {
+			if err := recalculateCardEntry(*cardID, p.year, p.month); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := recalcCardIfNotRepayment(oldCreditCardID); err != nil {
+		return err
+	}
+	if (oldCreditCardID == nil) != (r.CreditCardID == nil) ||
+		(oldCreditCardID != nil && r.CreditCardID != nil && *oldCreditCardID != *r.CreditCardID) {
+		if err := recalcCardIfNotRepayment(r.CreditCardID); err != nil {
+			return err
+		}
+	}
+
+	// A card's own repayment item's amount change still needs the full
+	// checkpoint/purchase-aware recalculation, not a direct overwrite.
+	if amountChanged && r.CreditCardID != nil && isCardRepaymentItem(*r.CreditCardID) {
+		rows, err := database.Query(`
+			SELECT DISTINCT period_year, period_month FROM entries
+			WHERE recurring_item_id = $1 AND actual_amount IS NULL`, id)
+		if err == nil {
+			type period struct{ year, month int }
+			var periods []period
+			for rows.Next() {
+				var p period
+				if rows.Scan(&p.year, &p.month) == nil {
+					periods = append(periods, p)
 				}
 			}
-		} else {
-			// Non-card item: simply update all unpaid planned entries to the new amount.
-			database.Exec(`
-				UPDATE entries SET planned_amount = $1
-				WHERE recurring_item_id = $2 AND actual_amount IS NULL`,
-				*r.DefaultAmount, id)
+			rows.Close()
+			for _, p := range periods {
+				recalculateCardEntry(*r.CreditCardID, p.year, p.month)
+			}
 		}
 	}
 	return nil
@@ -1396,6 +1458,7 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 			}
 		}
 
+		createdThisTemplate := 0
 		if t.frequency == "four_weekly" {
 			// A 28-day cycle can land twice in one calendar month -- each
 			// occurrence gets its own entry (own day, own single-occurrence
@@ -1411,6 +1474,7 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 					return created, err
 				}
 				created += n
+				createdThisTemplate += n
 			}
 		} else {
 			n, err := insertGeneratedEntry(t, 0, amount, dueDay)
@@ -1418,6 +1482,22 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 				return created, err
 			}
 			created += n
+			createdThisTemplate += n
+		}
+
+		// A newly-materialized entry tagged with a card, but not that card's
+		// own designated repayment item (e.g. "Dog pills" tagged to Jenny's
+		// card), needs that card's own stored bill total refreshed to pick it
+		// up right away -- otherwise the live-computed total (see
+		// GetCardTaggedExtras) and the card's own stored planned_amount
+		// silently disagree until something else happens to trigger a
+		// recalculation.
+		if createdThisTemplate > 0 && t.creditCardID != nil {
+			if item, found, ferr := recurringItemForCard(*t.creditCardID); ferr == nil && (!found || item.id != t.id) {
+				if err := recalculateCardEntry(*t.creditCardID, year, month); err != nil {
+					return created, err
+				}
+			}
 		}
 
 		// A card-linked item with sundries_amount set auto-generates its own
