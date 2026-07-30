@@ -11,6 +11,12 @@ they're listed against the month the card repayment actually covers them,
 not the month they were incurred in -- with a note showing that original
 date.
 
+Individual card purchases (the day-to-day tap-to-log kind, e.g. groceries)
+are also checked against that card's own history: any purchase costing more
+than its card's mean + 2 standard deviations (of past non-subscription
+purchases on that card) is unusual too, e.g. a one-off load of firewood
+logs put on the card, on top of the routine weekly shop.
+
 Usage:
   ./lookahead.py                          # from this month, 7 months, print + save
   ./lookahead.py --year 2026 --month 7 --count 7
@@ -18,6 +24,7 @@ Usage:
 """
 import argparse
 import datetime
+import statistics
 import urllib.request
 import json
 
@@ -63,7 +70,23 @@ def incurred_on(entry):
     return datetime.date(y, m, 1).strftime("%b %Y")
 
 
-def card_bill_extras(card, year, month, recurring_freq):
+def purchase_incurred_on(purchase):
+    return datetime.date.fromisoformat(purchase["purchase_date"][:10]).strftime("%-d %b")
+
+
+def purchase_threshold(card_id):
+    """mean + 2 standard deviations of this card's past non-subscription
+    purchases -- the bar an individual card purchase must clear to be
+    flagged unusual, e.g. a one-off load of firewood logs on top of the
+    routine weekly shop. None if there's not enough history to judge by."""
+    purchases = fetch(f"/card-purchases?credit_card_id={card_id}") or []
+    amounts = [p["amount"] for p in purchases if p.get("recurring_purchase_id") is None]
+    if len(amounts) < 2:
+        return None
+    return statistics.mean(amounts) + 2 * statistics.pstdev(amounts)
+
+
+def card_bill_extras(card, year, month, recurring_freq, threshold):
     """Unusual (non-routine) items folded into card's bill for (year, month),
     labelled with the date they were originally incurred on."""
     breakdown = fetch(
@@ -84,6 +107,15 @@ def card_bill_extras(card, year, month, recurring_freq):
             f"{e['name']} £{e['planned_amount']:.0f} ({freq}, incurred on "
             f"{incurred_on(e)}, via {card['name']})"
         )
+    for p in breakdown.get("purchases") or []:
+        if p.get("recurring_purchase_id") is not None:
+            continue  # a subscription -- routine by construction, whatever it costs
+        if threshold is None or p["amount"] <= threshold:
+            continue
+        items.append(
+            f"{p['description']} £{p['amount']:.0f} (unusual purchase, incurred on "
+            f"{purchase_incurred_on(p)}, via {card['name']})"
+        )
     return items
 
 
@@ -98,6 +130,7 @@ def main():
 
     recurring_freq = {r["id"]: r["frequency"] for r in fetch("/recurring-items")}
     cards = fetch("/credit-cards")
+    card_thresholds = {c["id"]: purchase_threshold(c["id"]) for c in cards}
     summaries = fetch(f"/forecast/range?year={args.year}&month={args.month}&count={args.count}")
 
     rows = []
@@ -107,7 +140,7 @@ def main():
         entries = fetch(f"/entries?year={y}&month={m}")
         unusual = unusual_expenses(entries, recurring_freq)
         for card in cards:
-            unusual += card_bill_extras(card, y, m, recurring_freq)
+            unusual += card_bill_extras(card, y, m, recurring_freq, card_thresholds[card["id"]])
         rows.append((y, m, s["income"], s["expense"], s["savings"], unusual))
         total_income += s["income"]
         total_expense += s["expense"]
@@ -134,8 +167,11 @@ def main():
     lines.append(f"**Average savings:** £{avg_savings:,.2f}/month")
     lines.append("")
     lines.append(
-        "\"Unusual\" covers manual one-off entries (no recurring template) and "
-        "entries from recurring items with a 3-monthly or annual frequency. "
+        "\"Unusual\" covers manual one-off entries (no recurring template), "
+        "entries from recurring items with a 3-monthly or annual frequency, "
+        "and individual card purchases costing more than that card's mean + "
+        "2 standard deviations of past non-subscription purchases (e.g. a "
+        "one-off load of firewood logs on top of the routine weekly shop). "
         "Routine monthly bills and the card sundries buffer are excluded. "
         "Unusual items paid for on a card are listed against the month the "
         "card repayment covers them, noted with when they were incurred."
