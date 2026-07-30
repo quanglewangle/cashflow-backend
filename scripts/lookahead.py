@@ -5,6 +5,12 @@ months, plus a per-month list of expenses that aren't the month's usual bills
 once a year, e.g. Dog pills, TV licence, Liberty). Excludes the recurring
 Jenny's card / Visacard sundries buffer, which is expected every month.
 
+Unusual items paid for on a card (e.g. a quarterly vet-meds order put on
+Jenny's card) are folded into that card's bill rather than paid in cash, so
+they're listed against the month the card repayment actually covers them,
+not the month they were incurred in -- with a note showing that original
+date.
+
 Usage:
   ./lookahead.py                          # from this month, 7 months, print + save
   ./lookahead.py --year 2026 --month 7 --count 7
@@ -39,14 +45,45 @@ def unusual_expenses(entries, recurring_freq):
     for e in entries:
         if e["item_type"] != "expense":
             continue
-        if "sundries" in e["name"].lower():
-            continue
+        if e.get("credit_card_id") is not None:
+            continue  # folded into a card's bill -- see card_bill_extras
         rid = e.get("recurring_item_id")
         if rid is None:
             items.append(f"{e['name']} £{e['planned_amount']:.0f} (one-off)")
         elif recurring_freq.get(rid) in ("three_monthly", "annual"):
             freq = recurring_freq[rid].replace("_", "-")
             items.append(f"{e['name']} £{e['planned_amount']:.0f} ({freq})")
+    return items
+
+
+def incurred_on(entry):
+    y, m, d = entry["period_year"], entry["period_month"], entry.get("due_day")
+    if d:
+        return datetime.date(y, m, d).strftime("%-d %b")
+    return datetime.date(y, m, 1).strftime("%b %Y")
+
+
+def card_bill_extras(card, year, month, recurring_freq):
+    """Unusual (non-routine) items folded into card's bill for (year, month),
+    labelled with the date they were originally incurred on."""
+    breakdown = fetch(
+        f"/card-payment-breakdown?credit_card_id={card['id']}&year={year}&month={month}"
+    )
+    items = []
+    for e in breakdown.get("one_offs") or []:
+        if e["item_type"] != "expense" or e.get("auto_sundries"):
+            continue
+        rid = e.get("recurring_item_id")
+        if rid is None:
+            freq = "one-off"
+        elif recurring_freq.get(rid) in ("three_monthly", "annual"):
+            freq = recurring_freq[rid].replace("_", "-")
+        else:
+            continue  # a routine monthly item merely billed via this card
+        items.append(
+            f"{e['name']} £{e['planned_amount']:.0f} ({freq}, incurred on "
+            f"{incurred_on(e)}, via {card['name']})"
+        )
     return items
 
 
@@ -60,6 +97,7 @@ def main():
     args = p.parse_args()
 
     recurring_freq = {r["id"]: r["frequency"] for r in fetch("/recurring-items")}
+    cards = fetch("/credit-cards")
     summaries = fetch(f"/forecast/range?year={args.year}&month={args.month}&count={args.count}")
 
     rows = []
@@ -68,6 +106,8 @@ def main():
         y, m = s["period_year"], s["period_month"]
         entries = fetch(f"/entries?year={y}&month={m}")
         unusual = unusual_expenses(entries, recurring_freq)
+        for card in cards:
+            unusual += card_bill_extras(card, y, m, recurring_freq)
         rows.append((y, m, s["income"], s["expense"], s["savings"], unusual))
         total_income += s["income"]
         total_expense += s["expense"]
@@ -96,7 +136,9 @@ def main():
     lines.append(
         "\"Unusual\" covers manual one-off entries (no recurring template) and "
         "entries from recurring items with a 3-monthly or annual frequency. "
-        "Routine monthly bills and the card sundries buffer are excluded."
+        "Routine monthly bills and the card sundries buffer are excluded. "
+        "Unusual items paid for on a card are listed against the month the "
+        "card repayment covers them, noted with when they were incurred."
     )
     lines.append("")
     lines.append(f"Generated {today.isoformat()} by scripts/lookahead.py.")
