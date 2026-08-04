@@ -2417,22 +2417,25 @@ type ForecastDanger struct {
 	MinBalance     float64 `json:"min_balance"`     // lowest intra-month running balance
 	MinBalanceDay  int     `json:"min_balance_day"` // day of month when minimum occurs
 	CarriedForward float64 `json:"carried_forward"`
-	// LowDays/LowOngoing describe the below-£0 streak containing MinBalanceDay
-	// (which can span months either side of this one) -- see ForecastDangerRange.
-	// LowDays is 0 when MinBalance >= 0. LowOngoing means the streak hadn't
-	// recovered within the lookahead window, so LowDays is a lower bound.
+	// LowDays is how many days MinBalanceDay's low point persists until the
+	// next in-payment (an income entry) lifts the balance back up -- not
+	// gated on MinBalance actually going negative, so a month that dips low
+	// without crossing £0 still gets a meaningful count. LowOngoing means no
+	// income entry was found within the lookahead window, so LowDays is a
+	// lower bound. See ForecastDangerRange.
 	LowDays    int  `json:"low_days"`
 	LowOngoing bool `json:"low_ongoing"`
 }
 
 // dayBalance is one point in a period's running-balance trace -- the
-// balance immediately after processing the entry due on that day. Used to
-// detect below-£0 streaks that may span multiple months (see
-// ForecastDangerRange), since the min/carried values alone don't preserve
-// enough of the walk to find where a streak starts or ends.
+// balance immediately after processing the entry due on that day, and that
+// entry's item_type. Used to find how long a month's low point persists
+// until the next in-payment lifts it (see ForecastDangerRange), since the
+// min/carried values alone don't preserve enough of the walk to find that.
 type dayBalance struct {
-	day     int
-	balance float64
+	day      int
+	balance  float64
+	itemType string
 }
 
 // periodMinBalance walks entries in (year, month) from startBalance and
@@ -2522,7 +2525,7 @@ func periodMinBalance(year, month, fromDay, trackMinFromDay int, startBalance fl
 		} else {
 			balance -= amount
 		}
-		trace = append(trace, dayBalance{day: day, balance: balance})
+		trace = append(trace, dayBalance{day: day, balance: balance, itemType: itemType})
 		if !tracking && day >= trackMinFromDay {
 			tracking = true
 			minBalance = balance
@@ -2611,41 +2614,35 @@ func ForecastDangerRange(fromYear, fromMonth, count int) ([]ForecastDanger, erro
 		y, m = nextPeriod(y, m)
 	}
 
-	// Single continuous walk across every month's trace to find each
-	// below-£0 streak's start/end -- a dip can span months, so this can't be
-	// derived independently per month the way MinBalance is.
-	type lowStreak struct {
-		start, end time.Time
-		ongoing    bool
+	// Flatten every month's trace into one chronological sequence, recording
+	// where each month's own trace starts within it, so a row's low point
+	// (found within its own month) can search forward past that month's end
+	// into later months for the in-payment that finally lifts it back up.
+	type tracePoint struct {
+		date     time.Time
+		balance  float64
+		itemType string
 	}
-	var streaks []lowStreak
-	var belowSince *time.Time
-	var lastDate time.Time
-	for _, r := range results {
+	var flat []tracePoint
+	monthStart := make([]int, len(results)+1)
+	for i, r := range results {
+		monthStart[i] = len(flat)
 		for _, pt := range r.trace {
 			day := pt.day
 			if day == 0 {
 				day = 1
 			}
-			date := time.Date(r.year, time.Month(r.month), day, 0, 0, 0, 0, time.UTC)
-			lastDate = date
-			if pt.balance < 0 {
-				if belowSince == nil {
-					d := date
-					belowSince = &d
-				}
-			} else if belowSince != nil {
-				streaks = append(streaks, lowStreak{start: *belowSince, end: date})
-				belowSince = nil
-			}
+			flat = append(flat, tracePoint{
+				date:     time.Date(r.year, time.Month(r.month), day, 0, 0, 0, 0, time.UTC),
+				balance:  pt.balance,
+				itemType: pt.itemType,
+			})
 		}
 	}
-	if belowSince != nil {
-		streaks = append(streaks, lowStreak{start: *belowSince, end: lastDate, ongoing: true})
-	}
+	monthStart[len(results)] = len(flat)
 
 	out := make([]ForecastDanger, 0, count)
-	for _, r := range results[:count] {
+	for i, r := range results[:count] {
 		fd := ForecastDanger{
 			PeriodYear: r.year, PeriodMonth: r.month,
 			BroughtForward: r.bf,
@@ -2653,23 +2650,43 @@ func ForecastDangerRange(fromYear, fromMonth, count int) ([]ForecastDanger, erro
 			MinBalanceDay:  r.minDay,
 			CarriedForward: r.carried,
 		}
-		if r.minBal < 0 {
-			day := r.minDay
-			if day == 0 {
-				day = 1
-			}
-			minDate := time.Date(r.year, time.Month(r.month), day, 0, 0, 0, 0, time.UTC)
-			for _, s := range streaks {
-				// Day-granularity means the streak's minimum and its recovery
-				// can land on the same calendar date (multiple entries due the
-				// same day) -- end must be an inclusive bound, not exclusive.
-				if !minDate.Before(s.start) && !minDate.After(s.end) {
-					fd.LowDays = int(s.end.Sub(s.start).Hours() / 24)
-					fd.LowOngoing = s.ongoing
+
+		day := r.minDay
+		if day == 0 {
+			day = 1
+		}
+		minDate := time.Date(r.year, time.Month(r.month), day, 0, 0, 0, 0, time.UTC)
+
+		// Start the forward search just past the entry that actually set
+		// this month's minimum -- that entry itself dropped the balance, so
+		// it can't be the in-payment that lifts it back up. When the minimum
+		// is simply the balance brought into the month (minDay == 0, no
+		// entry caused it), search from the month's very first entry instead.
+		searchFrom := monthStart[i]
+		if r.minDay > 0 {
+			for j := monthStart[i]; j < monthStart[i+1]; j++ {
+				if flat[j].date.Equal(minDate) && flat[j].balance == r.minBal {
+					searchFrom = j + 1
 					break
 				}
 			}
 		}
+
+		found := false
+		for j := searchFrom; j < len(flat); j++ {
+			if flat[j].itemType == "income" {
+				fd.LowDays = int(flat[j].date.Sub(minDate).Hours() / 24)
+				found = true
+				break
+			}
+		}
+		if !found {
+			fd.LowOngoing = true
+			if len(flat) > 0 {
+				fd.LowDays = int(flat[len(flat)-1].date.Sub(minDate).Hours() / 24)
+			}
+		}
+
 		out = append(out, fd)
 	}
 	return out, nil
