@@ -432,6 +432,39 @@ func recalculateCardEntry(cardID int64, year, month int) error {
 	return err
 }
 
+// recalculateCardEntryForExtra recalculates cardID's own stored bill total
+// for both the calendar period a card-tagged non-repayment recurring item's
+// entry naturally lives in (year, month) and -- if different -- the payment
+// period paymentPeriodFor would actually attribute it to given its due_day.
+// GeneratePeriodEntries stores such an entry under the calendar month it
+// naturally recurs in (so the Cashflow tab still shows it on its own due
+// date), never translated through paymentPeriodFor -- so the period
+// GetCardTaggedExtras actually folds it into (see there) can differ from
+// the period it's stored under, and both need their stored totals kept in
+// sync when this entry is created/changed/deleted.
+func recalculateCardEntryForExtra(cardID int64, year, month int, dueDay *int) error {
+	if err := recalculateCardEntry(cardID, year, month); err != nil {
+		return err
+	}
+	if dueDay == nil {
+		return nil
+	}
+	card, err := getCreditCard(cardID)
+	if err != nil {
+		return err
+	}
+	day := *dueDay
+	if last := daysInMonth(year, month); day > last {
+		day = last
+	}
+	date := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+	py, pm := paymentPeriodFor(card, date)
+	if py == year && pm == month {
+		return nil
+	}
+	return recalculateCardEntry(cardID, py, pm)
+}
+
 // sumPurchasesForPeriod totals this card's purchases whose payment period is
 // (year, month). If a card checkpoint's own date falls in that same payment
 // period (i.e. verifying/correcting the log partway through this statement
@@ -1070,22 +1103,25 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 			return nil
 		}
 		rows, err := database.Query(`
-			SELECT DISTINCT period_year, period_month FROM entries
+			SELECT period_year, period_month, due_day FROM entries
 			WHERE recurring_item_id = $1 AND actual_amount IS NULL`, id)
 		if err != nil {
 			return err
 		}
-		type period struct{ year, month int }
+		type period struct {
+			year, month int
+			dueDay      *int
+		}
 		var periods []period
 		for rows.Next() {
 			var p period
-			if rows.Scan(&p.year, &p.month) == nil {
+			if rows.Scan(&p.year, &p.month, &p.dueDay) == nil {
 				periods = append(periods, p)
 			}
 		}
 		rows.Close()
 		for _, p := range periods {
-			if err := recalculateCardEntry(*cardID, p.year, p.month); err != nil {
+			if err := recalculateCardEntryForExtra(*cardID, p.year, p.month, p.dueDay); err != nil {
 				return err
 			}
 		}
@@ -1130,7 +1166,7 @@ func DeleteRecurringItem(id int64) error {
 	// total -- capture which (card, period) pairs are about to lose an entry
 	// so their stored totals can be refreshed after the delete.
 	rows, err := database.Query(`
-		SELECT DISTINCT credit_card_id, period_year, period_month
+		SELECT credit_card_id, period_year, period_month, due_day
 		FROM entries WHERE recurring_item_id=$1 AND status='planned' AND credit_card_id IS NOT NULL`, id)
 	if err != nil {
 		return err
@@ -1138,11 +1174,12 @@ func DeleteRecurringItem(id int64) error {
 	type cardPeriod struct {
 		cardID      int64
 		year, month int
+		dueDay      *int
 	}
 	var affected []cardPeriod
 	for rows.Next() {
 		var cp cardPeriod
-		if err := rows.Scan(&cp.cardID, &cp.year, &cp.month); err != nil {
+		if err := rows.Scan(&cp.cardID, &cp.year, &cp.month, &cp.dueDay); err != nil {
 			rows.Close()
 			return err
 		}
@@ -1163,7 +1200,7 @@ func DeleteRecurringItem(id int64) error {
 	}
 
 	for _, cp := range affected {
-		if err := recalculateCardEntry(cp.cardID, cp.year, cp.month); err != nil {
+		if err := recalculateCardEntryForExtra(cp.cardID, cp.year, cp.month, cp.dueDay); err != nil {
 			return err
 		}
 	}
@@ -1240,8 +1277,9 @@ func UpdateEntry(id int64, e Entry) error {
 	var oldCreditCardID *int64
 	var periodYear, periodMonth int
 	var oldStatus string
-	_ = database.QueryRow(`SELECT recurring_item_id, credit_card_id, period_year, period_month, status FROM entries WHERE id=$1`, id).
-		Scan(&oldRecurringItemID, &oldCreditCardID, &periodYear, &periodMonth, &oldStatus)
+	var oldDueDay *int
+	_ = database.QueryRow(`SELECT recurring_item_id, credit_card_id, period_year, period_month, status, due_day FROM entries WHERE id=$1`, id).
+		Scan(&oldRecurringItemID, &oldCreditCardID, &periodYear, &periodMonth, &oldStatus, &oldDueDay)
 
 	// incurred_date records when this entry actually became incurred, so a
 	// card's checkpoint anchoring a later period can tell whether it was
@@ -1279,7 +1317,7 @@ func UpdateEntry(id int64, e Entry) error {
 	// affects, old and new, in case the tag was added, removed, or changed.
 	// The repayment entry itself doesn't need this -- recalculateCardEntry
 	// keeps it in sync via its own upsert (see the block below instead).
-	recalcIfNotRepayment := func(cardID *int64, recurringItemID *int64) error {
+	recalcIfNotRepayment := func(cardID *int64, recurringItemID *int64, dueDay *int) error {
 		if cardID == nil {
 			return nil
 		}
@@ -1290,14 +1328,14 @@ func UpdateEntry(id int64, e Entry) error {
 		if found && recurringItemID != nil && *recurringItemID == item.id {
 			return nil
 		}
-		return recalculateCardEntry(*cardID, periodYear, periodMonth)
+		return recalculateCardEntryForExtra(*cardID, periodYear, periodMonth, dueDay)
 	}
-	if err := recalcIfNotRepayment(oldCreditCardID, oldRecurringItemID); err != nil {
+	if err := recalcIfNotRepayment(oldCreditCardID, oldRecurringItemID, oldDueDay); err != nil {
 		return err
 	}
 	if (oldCreditCardID == nil) != (e.CreditCardID == nil) ||
 		(oldCreditCardID != nil && e.CreditCardID != nil && *oldCreditCardID != *e.CreditCardID) {
-		if err := recalcIfNotRepayment(e.CreditCardID, e.RecurringItemID); err != nil {
+		if err := recalcIfNotRepayment(e.CreditCardID, e.RecurringItemID, e.DueDay); err != nil {
 			return err
 		}
 	}
@@ -1532,7 +1570,7 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		// silently disagree until something else happens to trigger a
 		// recalculation.
 		if createdThisTemplate > 0 && t.creditCardID != nil && !isRepaymentItem {
-			if err := recalculateCardEntry(*t.creditCardID, year, month); err != nil {
+			if err := recalculateCardEntryForExtra(*t.creditCardID, year, month, dueDay); err != nil {
 				return created, err
 			}
 		}
@@ -1897,32 +1935,15 @@ func GetCardTaggedOneOffs(cardID int64, year, month int) ([]Entry, error) {
 	return out, nil
 }
 
-// GetCardTaggedExtras returns every entry tagged with this card for the given
-// payment period that isn't that same card's own designated repayment entry
-// -- true one-offs (a decaying sundries buffer) as well as any other
-// recurring item merely labelled with this card (e.g. a recurring purchase
-// actually paid via it, like a quarterly vet-meds order) rather than being
-// the card's repayment template itself. This is the broadened set folded
-// into the card's own bill total (see sumPurchasesForPeriod,
-// GetCardPaymentBreakdown) -- deliberately not used for AddCardCheckpoint's
-// "these might be redundant now" hint, which must stay scoped to
-// GetCardTaggedOneOffs's narrower true-one-offs-only set.
-func GetCardTaggedExtras(cardID int64, year, month int) ([]Entry, error) {
-	rows, err := database.Query(`
-		SELECT id, recurring_item_id, category_id, period_year, period_month,
-		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day,
-		       decay_per_week, decay_start_date, auto_sundries
-		FROM entries WHERE credit_card_id = $1
-		AND (recurring_item_id IS NULL OR recurring_item_id IS DISTINCT FROM (
-			SELECT ri.id FROM recurring_items ri
-			WHERE ri.credit_card_id = $1 AND ri.frequency = 'monthly' AND ri.active = TRUE
-			ORDER BY ri.id LIMIT 1
-		))
-		AND period_year = $2 AND period_month = $3
-		ORDER BY due_day NULLS LAST, id`, cardID, year, month)
-	if err != nil {
-		return nil, err
+// stepBackMonths steps (year, month) back by n calendar months.
+func stepBackMonths(year, month, n int) (int, int) {
+	for i := 0; i < n; i++ {
+		year, month = prevPeriod(year, month)
 	}
+	return year, month
+}
+
+func scanCardTaggedEntries(rows *sql.Rows) ([]Entry, error) {
 	defer rows.Close()
 	var out []Entry
 	for rows.Next() {
@@ -1934,6 +1955,97 @@ func GetCardTaggedExtras(cardID int64, year, month int) ([]Entry, error) {
 		}
 		e.EffectiveAmount = effectiveEntryAmount(e.PlannedAmount, e.ActualAmount, e.DecayPerWeek, e.DecayStartDate)
 		out = append(out, e)
+	}
+	return out, nil
+}
+
+// GetCardTaggedExtras returns every entry folded into this card's bill for
+// the given payment period that isn't that same card's own designated
+// repayment entry -- true one-offs (a decaying sundries buffer) as well as
+// any other recurring item merely labelled with this card (e.g. a recurring
+// purchase actually paid via it, like a quarterly vet-meds order) rather
+// than being the card's repayment template itself. This is the broadened
+// set folded into the card's own bill total (see sumPurchasesForPeriod,
+// GetCardPaymentBreakdown) -- deliberately not used for AddCardCheckpoint's
+// "these might be redundant now" hint, which must stay scoped to
+// GetCardTaggedOneOffs's narrower true-one-offs-only set.
+//
+// A true one-off (recurring_item_id IS NULL) is already stored under the
+// payment period it belongs to -- the user picks that period explicitly
+// when adding it -- so it's matched directly. A card-tagged recurring
+// item's entry, though, is generated by GeneratePeriodEntries at whatever
+// calendar month it naturally recurs in, due_day as-is, with no
+// statement-cycle translation (so the Cashflow tab still shows it on its
+// own due date) -- so it's folded in here based on which payment period
+// paymentPeriodFor would attribute a same-day purchase to, not its raw
+// period_year/period_month. paymentPeriodFor only ever pushes a date
+// forward by the statement-day check (0 or 1 month) plus
+// payment_due_month_offset months, so an entry whose payment period is
+// (year, month) can only have its natural period at (year, month) stepped
+// back by offset, or by offset+1 -- never further -- so only those two
+// candidate periods need to be queried.
+func GetCardTaggedExtras(cardID int64, year, month int) ([]Entry, error) {
+	card, err := getCreditCard(cardID)
+	if err != nil {
+		return nil, err
+	}
+	repaymentItemID := int64(-1) // sentinel: no repayment item tagged to this card
+	if item, found, ferr := recurringItemForCard(cardID); ferr == nil && found {
+		repaymentItemID = item.id
+	}
+
+	oneOffRows, err := database.Query(`
+		SELECT id, recurring_item_id, category_id, period_year, period_month,
+		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day,
+		       decay_per_week, decay_start_date, auto_sundries
+		FROM entries WHERE credit_card_id = $1 AND recurring_item_id IS NULL
+		AND period_year = $2 AND period_month = $3
+		ORDER BY due_day NULLS LAST, id`, cardID, year, month)
+	if err != nil {
+		return nil, err
+	}
+	out, err := scanCardTaggedEntries(oneOffRows)
+	if err != nil {
+		return nil, err
+	}
+
+	y1, m1 := stepBackMonths(year, month, card.PaymentDueMonthOffset)
+	y2, m2 := prevPeriod(y1, m1)
+	recurringRows, err := database.Query(`
+		SELECT id, recurring_item_id, category_id, period_year, period_month,
+		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day,
+		       decay_per_week, decay_start_date, auto_sundries
+		FROM entries WHERE credit_card_id = $1 AND recurring_item_id IS NOT NULL
+		AND recurring_item_id != $2
+		AND ((period_year=$3 AND period_month=$4) OR (period_year=$5 AND period_month=$6))
+		ORDER BY due_day NULLS LAST, id`, cardID, repaymentItemID, y1, m1, y2, m2)
+	if err != nil {
+		return nil, err
+	}
+	candidates, err := scanCardTaggedEntries(recurringRows)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range candidates {
+		if e.DueDay == nil {
+			// Defensive: no day to project from (shouldn't happen for
+			// anything GeneratePeriodEntries creates today, since every
+			// frequency it auto-generates sets due_day) -- fall back to the
+			// pre-fix direct match so nothing silently vanishes.
+			if e.PeriodYear == year && e.PeriodMonth == month {
+				out = append(out, e)
+			}
+			continue
+		}
+		day := *e.DueDay
+		if last := daysInMonth(e.PeriodYear, e.PeriodMonth); day > last {
+			day = last
+		}
+		date := time.Date(e.PeriodYear, time.Month(e.PeriodMonth), day, 0, 0, 0, 0, time.UTC)
+		py, pm := paymentPeriodFor(card, date)
+		if py == year && pm == month {
+			out = append(out, e)
+		}
 	}
 	return out, nil
 }
