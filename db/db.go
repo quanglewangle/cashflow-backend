@@ -1517,6 +1517,13 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 			createdThisTemplate += n
 		}
 
+		isRepaymentItem := false
+		if t.creditCardID != nil {
+			if item, found, ferr := recurringItemForCard(*t.creditCardID); ferr == nil && found && item.id == t.id {
+				isRepaymentItem = true
+			}
+		}
+
 		// A newly-materialized entry tagged with a card, but not that card's
 		// own designated repayment item (e.g. "Dog pills" tagged to Jenny's
 		// card), needs that card's own stored bill total refreshed to pick it
@@ -1524,11 +1531,9 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		// GetCardTaggedExtras) and the card's own stored planned_amount
 		// silently disagree until something else happens to trigger a
 		// recalculation.
-		if createdThisTemplate > 0 && t.creditCardID != nil {
-			if item, found, ferr := recurringItemForCard(*t.creditCardID); ferr == nil && (!found || item.id != t.id) {
-				if err := recalculateCardEntry(*t.creditCardID, year, month); err != nil {
-					return created, err
-				}
+		if createdThisTemplate > 0 && t.creditCardID != nil && !isRepaymentItem {
+			if err := recalculateCardEntry(*t.creditCardID, year, month); err != nil {
+				return created, err
 			}
 		}
 
@@ -1589,6 +1594,23 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 						return created, err
 					}
 				}
+			}
+		}
+
+		// A card's own repayment entry is a stored snapshot: recalculateCardEntry
+		// bakes in the *current* effective_amount of any decaying extra tagged to
+		// the card (e.g. the auto-sundries buffer above) at the moment it runs,
+		// but that extra keeps decaying live on every read afterwards
+		// (effectiveEntryAmount) -- pure time passing never re-triggers a
+		// recalculation, so the entry drifts stale from GetCardPaymentBreakdown's
+		// always-live total until some unrelated write happens to touch this
+		// card/period. The app calls /periods/generate before every entries fetch
+		// (see Repository.loadPeriod), so refreshing unconditionally here --
+		// not just when something new was created above -- keeps the two in sync
+		// on every screen load instead of only self-healing on the next write.
+		if isRepaymentItem {
+			if err := recalculateCardEntry(*t.creditCardID, year, month); err != nil {
+				return created, err
 			}
 		}
 	}
