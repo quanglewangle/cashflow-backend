@@ -2735,6 +2735,12 @@ func ForecastDangerRange(fromYear, fromMonth, count int) ([]ForecastDanger, erro
 					fd.LowDays = int(flat[len(flat)-1].date.Sub(minDate).Hours() / 24)
 				}
 			}
+			// The low point is itself a real low day even when the in-payment
+			// that lifts it lands the very same calendar date (a same-day
+			// expense-then-income ordering, e.g.) -- floor at 1 rather than 0.
+			if fd.LowDays < 1 {
+				fd.LowDays = 1
+			}
 		}
 
 		out = append(out, fd)
