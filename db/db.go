@@ -644,6 +644,21 @@ func windowEndForPeriod(card CreditCard, year, month int) time.Time {
 	return time.Date(y, time.Month(m), card.StatementDay, 0, 0, 0, 0, time.UTC)
 }
 
+// windowStartForPeriod returns the statement-close date that opens payment
+// period (year, month)'s window -- i.e. windowEndForPeriod of the previous
+// payment period. Used as the no-checkpoint decay start for a fresh
+// auto-sundries buffer: GeneratePeriodEntries can materialize a period's
+// buffer well before that period's own window has even opened (Forecast/Grid
+// sweep many consecutive months ahead), so anchoring decay to "today" would
+// make a future period's buffer start decaying before any of its window has
+// elapsed. effectiveEntryAmount already floors weeksElapsed at zero for a
+// decay_start_date still in the future, so a not-yet-open window simply
+// shows the full undecayed amount until it actually opens.
+func windowStartForPeriod(card CreditCard, year, month int) time.Time {
+	py, pm := prevPeriod(year, month)
+	return windowEndForPeriod(card, py, pm)
+}
+
 // proRatedSundries sizes a card's auto-sundries buffer down to just the
 // remainder of its payment period's window still uncovered by a checkpoint --
 // a checkpoint only vouches for spending up to its own date, so only the
@@ -1598,7 +1613,7 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 				return created, cerr
 			}
 			amount := *t.sundriesAmount
-			decayStart := time.Now().Truncate(24 * time.Hour)
+			decayStart := windowStartForPeriod(card, year, month)
 			skipInsert := false
 
 			checkpoint, hasCheckpoint, cerr := latestCardCheckpointForPeriod(card, year, month)
