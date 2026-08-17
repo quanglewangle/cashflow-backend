@@ -127,10 +127,13 @@ type Entry struct {
 	// created automatically from a recurring item's sundries_amount, rather
 	// than one added by hand (see migration 016).
 	AutoSundries bool `json:"auto_sundries"`
-	// IncurredDate is when this entry's status last became incurred -- only
-	// populated by queries that need it (see sumUnpaidPriorCardBills), not
-	// exposed to the client.
-	IncurredDate *time.Time `json:"-"`
+	// IncurredDate is when this entry actually became incurred (paid/received) --
+	// defaults to today if the client omits it on the planned->incurred
+	// transition, but the client may set it explicitly (e.g. a bank payment
+	// notification's own date, or a backdated manual entry) so a checkpoint
+	// taken between that real date and the entry's due_day doesn't double-count
+	// it -- see periodNetFrom/periodMinBalance and sumUnpaidPriorCardBills.
+	IncurredDate *time.Time `json:"incurred_date"`
 	// EffectiveAmount is PlannedAmount with any decay applied as of now --
 	// computed at read time, never stored. Client display/balance math
 	// should prefer this over PlannedAmount; edit dialogs should still
@@ -1228,7 +1231,7 @@ func GetEntries(year, month int) ([]Entry, error) {
 	rows, err := database.Query(`
 		SELECT id, recurring_item_id, category_id, period_year, period_month,
 		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day,
-		       decay_per_week, decay_start_date, auto_sundries
+		       decay_per_week, decay_start_date, auto_sundries, incurred_date
 		FROM entries WHERE period_year=$1 AND period_month=$2 ORDER BY due_day NULLS LAST, id`, year, month)
 	if err != nil {
 		return nil, err
@@ -1239,7 +1242,7 @@ func GetEntries(year, month int) ([]Entry, error) {
 		var e Entry
 		if err := rows.Scan(&e.ID, &e.RecurringItemID, &e.CategoryID, &e.PeriodYear, &e.PeriodMonth,
 			&e.Name, &e.ItemType, &e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID, &e.DueDay,
-			&e.DecayPerWeek, &e.DecayStartDate, &e.AutoSundries); err != nil {
+			&e.DecayPerWeek, &e.DecayStartDate, &e.AutoSundries, &e.IncurredDate); err != nil {
 			return nil, err
 		}
 		e.EffectiveAmount = effectiveEntryAmount(e.PlannedAmount, e.ActualAmount, e.DecayPerWeek, e.DecayStartDate)
@@ -1253,14 +1256,23 @@ func AddEntry(e Entry) (int64, error) {
 		today := time.Now().Truncate(24 * time.Hour)
 		e.DecayStartDate = &today
 	}
+	// An entry can be created already incurred (e.g. ConfirmBankPaymentActivity's
+	// one-off add for a bank notification that's already happened) -- default its
+	// incurred_date to today unless the client supplied the real date.
+	if e.Status == "incurred" && e.IncurredDate == nil {
+		today := time.Now().Truncate(24 * time.Hour)
+		e.IncurredDate = &today
+	}
 	var id int64
 	err := database.QueryRow(`
 		INSERT INTO entries
 			(recurring_item_id, category_id, period_year, period_month, name, item_type,
-			 planned_amount, actual_amount, status, credit_card_id, due_day, decay_per_week, decay_start_date)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+			 planned_amount, actual_amount, status, credit_card_id, due_day, decay_per_week, decay_start_date,
+			 incurred_date)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
 		e.RecurringItemID, e.CategoryID, e.PeriodYear, e.PeriodMonth, e.Name, e.ItemType,
 		e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID, e.DueDay, e.DecayPerWeek, e.DecayStartDate,
+		e.IncurredDate,
 	).Scan(&id)
 	if err != nil {
 		return id, err
@@ -1297,13 +1309,19 @@ func UpdateEntry(id int64, e Entry) error {
 		Scan(&oldRecurringItemID, &oldCreditCardID, &periodYear, &periodMonth, &oldStatus, &oldDueDay)
 
 	// incurred_date records when this entry actually became incurred, so a
-	// card's checkpoint anchoring a later period can tell whether it was
-	// taken before or after -- see sumUnpaidPriorCardBills. Only stamped on
-	// the planned -> incurred transition; left untouched on a no-op re-save,
-	// and cleared if reverted back to planned.
+	// checkpoint taken between that real date and the entry's due_day doesn't
+	// double-count it -- see periodNetFrom/periodMinBalance and
+	// sumUnpaidPriorCardBills. The client may set it explicitly (e.g. the
+	// Mark paid/received dialog's date picker, or a bank notification's own
+	// date) to record a payment that happened early/late/backdated; if it
+	// doesn't, fall back to preserving whatever's already stored on a no-op
+	// re-save, or stamping today on a fresh planned -> incurred transition.
+	// Cleared if reverted back to planned.
 	var incurredDate *time.Time
 	if e.Status == "incurred" {
-		if oldStatus == "incurred" {
+		if e.IncurredDate != nil {
+			incurredDate = e.IncurredDate
+		} else if oldStatus == "incurred" {
 			_ = database.QueryRow(`SELECT incurred_date FROM entries WHERE id=$1`, id).Scan(&incurredDate)
 		} else {
 			today := time.Now().Truncate(24 * time.Hour)
@@ -2304,7 +2322,11 @@ func periodNetFrom(year, month, fromDay int) (income, expense, savings float64, 
 			)`, year, month)
 	} else {
 		// Exclude entries already incurred on the checkpoint day — they are baked
-		// into the checkpoint balance and must not be counted again.
+		// into the checkpoint balance and must not be counted again. Also exclude
+		// anything incurred strictly before the checkpoint date regardless of its
+		// due_day -- e.g. paid a few days early -- since a checkpoint taken after
+		// that already reflects it in the real bank balance.
+		checkpointDate := time.Date(year, time.Month(month), fromDay, 0, 0, 0, 0, time.UTC)
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date
 			FROM entries WHERE period_year=$1 AND period_month=$2
@@ -2320,7 +2342,9 @@ func periodNetFrom(year, month, fromDay int) (income, expense, savings float64, 
 				due_day IS NULL
 				OR due_day > $3
 				OR (due_day = $3 AND (status IS NULL OR status != 'incurred'))
-			)`, year, month, fromDay)
+			)
+			AND NOT (status = 'incurred' AND incurred_date IS NOT NULL AND incurred_date <= $4)`,
+			year, month, fromDay, checkpointDate)
 	}
 	if err != nil {
 		return 0, 0, 0, err
@@ -2481,7 +2505,9 @@ func periodMinBalance(year, month, fromDay, trackMinFromDay int, startBalance fl
 	} else {
 		// Exclude entries already incurred on the checkpoint day — they are baked
 		// into startBalance (the checkpoint balance) and must not be counted again.
-		// Mirrors periodNetFrom's exclusion rule exactly.
+		// Mirrors periodNetFrom's exclusion rule exactly, including the
+		// incurred-before-the-checkpoint-date case (e.g. paid a few days early).
+		checkpointDate := time.Date(year, time.Month(month), fromDay, 0, 0, 0, 0, time.UTC)
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date, COALESCE(due_day, 0)
 			FROM entries WHERE period_year=$1 AND period_month=$2
@@ -2498,7 +2524,8 @@ func periodMinBalance(year, month, fromDay, trackMinFromDay int, startBalance fl
 				OR due_day > $3
 				OR (due_day = $3 AND (status IS NULL OR status != 'incurred'))
 			)
-			ORDER BY COALESCE(due_day, 0)`, year, month, fromDay)
+			AND NOT (status = 'incurred' AND incurred_date IS NOT NULL AND incurred_date <= $4)
+			ORDER BY COALESCE(due_day, 0)`, year, month, fromDay, checkpointDate)
 	}
 	if err != nil {
 		return
