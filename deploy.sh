@@ -15,6 +15,9 @@ echo "Copying binary to $SERVER..."
 scp /tmp/cashflow_deploy "$SERVER":/tmp/cashflow_new
 
 echo "Installing on $SERVER..."
-ssh "$SERVER" "mv /tmp/cashflow_new /home/peter/cashflow && systemctl --user restart cashflow && systemctl --user is-active cashflow"
+# chmod explicitly -- scp from a Windows client drops the executable bit
+# (Windows has no such concept), which otherwise crash-loops the service
+# with exit 203/EXEC.
+ssh "$SERVER" "chmod +x /tmp/cashflow_new && mv /tmp/cashflow_new /home/peter/cashflow && systemctl --user restart cashflow && systemctl --user is-active cashflow"
 
 echo "Done — deployed $HASH to $SERVER"
