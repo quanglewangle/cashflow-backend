@@ -1063,7 +1063,13 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 	}
 
 	// Propagate due_day change to unpaid entries so their position matches the template.
-	if r.DueDay != nil {
+	// A four_weekly item's day drifts month to month, so its template due_day is
+	// meaningless for any particular entry -- realign from the anchor instead.
+	if r.Frequency == "four_weekly" && r.AnchorDate != nil {
+		if err := realignFourWeeklyEntries(id); err != nil {
+			return err
+		}
+	} else if r.DueDay != nil {
 		database.Exec(`UPDATE entries SET due_day = $1 WHERE recurring_item_id = $2 AND actual_amount IS NULL`,
 			*r.DueDay, id)
 	}
@@ -1825,6 +1831,81 @@ func fourWeeklyDaysInMonth(anchor time.Time, year, month int) []int {
 		}
 	}
 	return days
+}
+
+// realignFourWeeklyEntries resets every unpaid entry of four_weekly item id to
+// the occurrence days its anchor_date actually gives for that entry's month:
+// occurrence_seq N gets the Nth day, a month the drift now gives an extra
+// occurrence gets a new entry, and an unpaid entry for an occurrence that no
+// longer exists is removed. Paid entries are left alone. Without this, entries
+// generated while the item had a different frequency or anchor (or stamped
+// with the template's fixed due_day on save) keep the wrong day forever, since
+// GeneratePeriodEntries only backfills a NULL due_day.
+func realignFourWeeklyEntries(id int64) error {
+	var t struct {
+		categoryID    int64
+		name          string
+		itemType      string
+		defaultAmount *float64
+		anchorDate    time.Time
+		creditCardID  *int64
+	}
+	if err := database.QueryRow(`
+		SELECT category_id, name, item_type, default_amount, anchor_date, credit_card_id
+		FROM recurring_items WHERE id = $1 AND anchor_date IS NOT NULL`, id).
+		Scan(&t.categoryID, &t.name, &t.itemType, &t.defaultAmount, &t.anchorDate, &t.creditCardID); err != nil {
+		return err
+	}
+	amount := 0.0
+	if t.defaultAmount != nil {
+		amount = *t.defaultAmount
+	}
+
+	rows, err := database.Query(`
+		SELECT DISTINCT period_year, period_month FROM entries
+		WHERE recurring_item_id = $1 AND actual_amount IS NULL`, id)
+	if err != nil {
+		return err
+	}
+	type period struct{ year, month int }
+	var periods []period
+	for rows.Next() {
+		var p period
+		if err := rows.Scan(&p.year, &p.month); err != nil {
+			rows.Close()
+			return err
+		}
+		periods = append(periods, p)
+	}
+	rows.Close()
+
+	for _, p := range periods {
+		days := fourWeeklyDaysInMonth(t.anchorDate, p.year, p.month)
+		for seq, day := range days {
+			if _, err := database.Exec(`
+				UPDATE entries SET due_day = $1
+				WHERE recurring_item_id = $2 AND period_year = $3 AND period_month = $4
+				  AND occurrence_seq = $5 AND actual_amount IS NULL`,
+				day, id, p.year, p.month, seq); err != nil {
+				return err
+			}
+			if _, err := database.Exec(`
+				INSERT INTO entries (recurring_item_id, category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id, due_day, occurrence_seq)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+				ON CONFLICT (recurring_item_id, period_year, period_month, occurrence_seq) DO NOTHING`,
+				id, t.categoryID, p.year, p.month, t.name, t.itemType, amount, t.creditCardID, day, seq); err != nil {
+				return err
+			}
+		}
+		if _, err := database.Exec(`
+			DELETE FROM entries
+			WHERE recurring_item_id = $1 AND period_year = $2 AND period_month = $3
+			  AND occurrence_seq >= $4 AND actual_amount IS NULL`,
+			id, p.year, p.month, len(days)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // lastWorkingDayOfMonth returns the last Monday-Friday of the given month.
