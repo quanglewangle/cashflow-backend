@@ -709,6 +709,93 @@ func main() {
 		})
 	})
 
+	// GET /savings-accounts lists savings accounts with today's balance.
+	// POST /savings-accounts adds one.
+	http.HandleFunc("/savings-accounts", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			accounts, err := db.GetSavingsAccounts()
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if accounts == nil {
+				accounts = []db.SavingsAccount{}
+			}
+			writeJSON(w, http.StatusOK, accounts)
+		case http.MethodPost:
+			if !okToWrite(w, r) {
+				return
+			}
+			var a db.SavingsAccount
+			if err := json.NewDecoder(r.Body).Decode(&a); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid JSON")
+				return
+			}
+			id, err := db.AddSavingsAccount(a)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+
+	// PUT /savings-accounts/{id} edits an account -- setting a fresh
+	// opening_balance/opening_date re-anchors it to a real figure.
+	// GET /savings-accounts/{id}/projection?months=N returns month-by-month
+	// balances from the opening month through N months from now (default 12).
+	http.HandleFunc("/savings-accounts/", func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimSuffix(r.URL.Path, "/")
+		if strings.HasSuffix(path, "/projection") {
+			if r.Method != http.MethodGet {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			id, err := idFromPath(strings.TrimSuffix(path, "/projection"))
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid id")
+				return
+			}
+			months, ok := intQueryParam(r, "months")
+			if !ok || months < 1 {
+				months = 12
+			}
+			projection, err := db.SavingsProjection(id, months)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, projection)
+			return
+		}
+		id, err := idFromPath(path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			if !okToWrite(w, r) {
+				return
+			}
+			var a db.SavingsAccount
+			if err := json.NewDecoder(r.Body).Decode(&a); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid JSON")
+				return
+			}
+			if err := db.UpdateSavingsAccount(id, a); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+
 	// GET /checkpoints lists every known-good balance recorded so far.
 	// POST /checkpoints adds (or replaces, if the period already has one)
 	// a checkpoint -- e.g. after checking the real bank app -- which

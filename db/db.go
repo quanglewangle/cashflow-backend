@@ -134,6 +134,11 @@ type Entry struct {
 	// taken between that real date and the entry's due_day doesn't double-count
 	// it -- see periodNetFrom/periodMinBalance and sumUnpaidPriorCardBills.
 	IncurredDate *time.Time `json:"incurred_date"`
+	// SavingsAccountID tags this entry as a transfer between cash and a
+	// savings account: into it for item_type savings, out of it for income.
+	// A savings entry with none given is tagged with the first account by a
+	// DB trigger (migration 019); an expense entry never carries one.
+	SavingsAccountID *int64 `json:"savings_account_id"`
 	// EffectiveAmount is PlannedAmount with any decay applied as of now --
 	// computed at read time, never stored. Client display/balance math
 	// should prefer this over PlannedAmount; edit dialogs should still
@@ -1249,7 +1254,7 @@ func GetEntries(year, month int) ([]Entry, error) {
 	rows, err := database.Query(`
 		SELECT id, recurring_item_id, category_id, period_year, period_month,
 		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day,
-		       decay_per_week, decay_start_date, auto_sundries, incurred_date
+		       decay_per_week, decay_start_date, auto_sundries, incurred_date, savings_account_id
 		FROM entries WHERE period_year=$1 AND period_month=$2 ORDER BY due_day NULLS LAST, id`, year, month)
 	if err != nil {
 		return nil, err
@@ -1260,7 +1265,7 @@ func GetEntries(year, month int) ([]Entry, error) {
 		var e Entry
 		if err := rows.Scan(&e.ID, &e.RecurringItemID, &e.CategoryID, &e.PeriodYear, &e.PeriodMonth,
 			&e.Name, &e.ItemType, &e.PlannedAmount, &e.ActualAmount, &e.Status, &e.CreditCardID, &e.DueDay,
-			&e.DecayPerWeek, &e.DecayStartDate, &e.AutoSundries, &e.IncurredDate); err != nil {
+			&e.DecayPerWeek, &e.DecayStartDate, &e.AutoSundries, &e.IncurredDate, &e.SavingsAccountID); err != nil {
 			return nil, err
 		}
 		e.EffectiveAmount = effectiveEntryAmount(e.PlannedAmount, e.ActualAmount, e.DecayPerWeek, e.DecayStartDate)
@@ -1286,11 +1291,11 @@ func AddEntry(e Entry) (int64, error) {
 		INSERT INTO entries
 			(recurring_item_id, category_id, period_year, period_month, name, item_type,
 			 planned_amount, actual_amount, status, credit_card_id, due_day, decay_per_week, decay_start_date,
-			 incurred_date)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+			 incurred_date, savings_account_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
 		e.RecurringItemID, e.CategoryID, e.PeriodYear, e.PeriodMonth, e.Name, e.ItemType,
 		e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID, e.DueDay, e.DecayPerWeek, e.DecayStartDate,
-		e.IncurredDate,
+		e.IncurredDate, e.SavingsAccountID,
 	).Scan(&id)
 	if err != nil {
 		return id, err
@@ -1351,10 +1356,10 @@ func UpdateEntry(id int64, e Entry) error {
 		UPDATE entries SET
 			category_id=$2, name=$3, item_type=$4, planned_amount=$5,
 			actual_amount=$6, status=$7, credit_card_id=$8, due_day=$9,
-			decay_per_week=$10, decay_start_date=$11, incurred_date=$12
+			decay_per_week=$10, decay_start_date=$11, incurred_date=$12, savings_account_id=$13
 		WHERE id=$1`,
 		id, e.CategoryID, e.Name, e.ItemType, e.PlannedAmount, e.ActualAmount, e.Status, e.CreditCardID, e.DueDay,
-		e.DecayPerWeek, e.DecayStartDate, incurredDate,
+		e.DecayPerWeek, e.DecayStartDate, incurredDate, e.SavingsAccountID,
 	)
 	if err != nil {
 		return err
