@@ -1067,6 +1067,37 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 		return err
 	}
 
+	// An inactive template stops generating entries, but ones generated ahead
+	// of time while it was active would otherwise linger and keep counting in
+	// the forecast (e.g. a pension replaced by a split pair, double-counted
+	// for months). Drop its unpaid entries from the current period on; past
+	// periods and anything paid stay as history. DeleteEntry keeps any card
+	// bill totals in step.
+	if !r.Active {
+		now := time.Now()
+		rows, err := database.Query(`
+			SELECT id FROM entries
+			WHERE recurring_item_id = $1 AND status = 'planned' AND actual_amount IS NULL
+			  AND (period_year, period_month) >= ($2, $3)`,
+			id, now.Year(), int(now.Month()))
+		if err != nil {
+			return err
+		}
+		var stale []int64
+		for rows.Next() {
+			var entryID int64
+			if rows.Scan(&entryID) == nil {
+				stale = append(stale, entryID)
+			}
+		}
+		rows.Close()
+		for _, entryID := range stale {
+			if err := DeleteEntry(entryID); err != nil {
+				return err
+			}
+		}
+	}
+
 	// Propagate due_day change to unpaid entries so their position matches the template.
 	// A four_weekly item's day drifts month to month, so its template due_day is
 	// meaningless for any particular entry -- realign from the anchor instead.
