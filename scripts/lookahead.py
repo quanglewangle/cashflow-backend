@@ -20,7 +20,7 @@ logs put on the card, on top of the routine weekly shop.
 Usage:
   ./lookahead.py                          # from this month, 7 months, print + save
   ./lookahead.py --year 2026 --month 7 --count 7
-  ./lookahead.py --out ~/cashflow-forecast.md
+  ./lookahead.py --out /tmp/forecast.md   # default: <repo>/cashflow-forecast.md (gitignored)
 """
 import argparse
 import datetime
@@ -125,7 +125,7 @@ def main():
     p.add_argument("--year", type=int, default=today.year)
     p.add_argument("--month", type=int, default=today.month)
     p.add_argument("--count", type=int, default=7)
-    p.add_argument("--out", default=str(__import__("pathlib").Path.home() / "cashflow-forecast.md"))
+    p.add_argument("--out", default=str(__import__("pathlib").Path(__file__).resolve().parent.parent / "cashflow-forecast.md"))
     args = p.parse_args()
 
     recurring_freq = {r["id"]: r["frequency"] for r in fetch("/recurring-items")}
