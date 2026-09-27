@@ -488,12 +488,14 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 	// recalculateCardEntry's default_amount fallback always fires, same as
 	// "nothing logged yet" does for a pay-in-full card. Checkpoints/purchases
 	// still feed CurrentCardBalance separately, just not this total.
+	var hasCheckpoint bool
+	var afterDate time.Time
 	if !card.CarriesBalance {
-		checkpoint, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
+		var checkpoint CardCheckpoint
+		checkpoint, hasCheckpoint, err = latestCardCheckpointForPeriod(card, year, month)
 		if err != nil {
 			return 0, false, 0, err
 		}
-		var afterDate time.Time
 		if hasCheckpoint {
 			total = checkpoint.Balance
 			hasData = true
@@ -569,6 +571,9 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 		return 0, false, 0, err
 	}
 	for _, e := range extras {
+		if hasCheckpoint && extraCoveredByCheckpoint(e, afterDate) {
+			continue // already reflected in the checkpoint balance
+		}
 		if e.ItemType == "income" {
 			oneOffTotal -= e.EffectiveAmount
 		} else {
@@ -723,6 +728,7 @@ type CardPaymentBreakdown struct {
 	CoveredByCheckpoint []CardPurchase  `json:"covered_by_checkpoint"`
 	Purchases           []CardPurchase  `json:"purchases"`
 	OneOffs             []Entry         `json:"one_offs"`            // card-tagged one-offs added on top (e.g. a sundries buffer)
+	CoveredExtras       []Entry         `json:"covered_extras"`      // card-tagged recurring items already in the checkpoint (informational -- see extraCoveredByCheckpoint)
 	UnpaidPriorBill     *Entry          `json:"unpaid_prior_bill"`   // netted out -- see sumUnpaidPriorCardBills
 	DefaultAmountUsed   *float64        `json:"default_amount_used"` // set when no checkpoint/purchase exists yet and the recurring item's flat default was used instead -- see recalculateCardEntry
 	EntryID             *int64          `json:"entry_id"`            // the card's own generated entry for this period, for editing it directly
@@ -771,6 +777,8 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 		}
 	}
 
+	var hasCheckpoint bool
+	var afterDate time.Time
 	if card.CarriesBalance {
 		// Checkpoints/purchases never drive this card's payment amount (see
 		// sumPurchasesForPeriod) -- the breakdown mirrors that honestly by
@@ -783,11 +791,11 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 			result.Total = amt
 		}
 	} else {
-		checkpoint, hasCheckpoint, err := latestCardCheckpointForPeriod(card, year, month)
+		var checkpoint CardCheckpoint
+		checkpoint, hasCheckpoint, err = latestCardCheckpointForPeriod(card, year, month)
 		if err != nil {
 			return CardPaymentBreakdown{}, err
 		}
-		var afterDate time.Time
 		if hasCheckpoint {
 			cp := checkpoint
 			result.Checkpoint = &cp
@@ -861,6 +869,10 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 		return CardPaymentBreakdown{}, err
 	}
 	for _, e := range oneOffs {
+		if hasCheckpoint && extraCoveredByCheckpoint(e, afterDate) {
+			result.CoveredExtras = append(result.CoveredExtras, e)
+			continue
+		}
 		result.OneOffs = append(result.OneOffs, e)
 		if e.ItemType == "income" {
 			result.Total -= e.EffectiveAmount
@@ -1992,6 +2004,32 @@ func scanCardTaggedEntries(rows *sql.Rows) ([]Entry, error) {
 	return out, nil
 }
 
+// cardTaggedExtraDate is the calendar date a card-tagged recurring item's
+// entry lands on the card (its natural period plus due_day, clamped to the
+// month's length). ok=false for a true one-off or an entry with no due_day,
+// neither of which carries a date to place it before or after anything.
+func cardTaggedExtraDate(e Entry) (date time.Time, ok bool) {
+	if e.RecurringItemID == nil || e.DueDay == nil {
+		return time.Time{}, false
+	}
+	day := *e.DueDay
+	if last := daysInMonth(e.PeriodYear, e.PeriodMonth); day > last {
+		day = last
+	}
+	return time.Date(e.PeriodYear, time.Month(e.PeriodMonth), day, 0, 0, 0, 0, time.UTC), true
+}
+
+// extraCoveredByCheckpoint reports whether a card-tagged extra is already
+// baked into a checkpoint's balance -- the same rule a card_purchases row
+// gets (dated on or before the checkpoint = already posted), so it isn't
+// added on top a second time. Only dated recurring-item extras qualify; a
+// sundries buffer is pro-rated against the checkpoint separately (see
+// adjustAutoSundriesForCheckpoint), and other true one-offs are undated.
+func extraCoveredByCheckpoint(e Entry, checkpointDate time.Time) bool {
+	date, ok := cardTaggedExtraDate(e)
+	return ok && !date.After(checkpointDate)
+}
+
 // GetCardTaggedExtras returns every entry folded into this card's bill for
 // the given payment period that isn't that same card's own designated
 // repayment entry -- true one-offs (a decaying sundries buffer) as well as
@@ -2070,11 +2108,7 @@ func GetCardTaggedExtras(cardID int64, year, month int) ([]Entry, error) {
 			}
 			continue
 		}
-		day := *e.DueDay
-		if last := daysInMonth(e.PeriodYear, e.PeriodMonth); day > last {
-			day = last
-		}
-		date := time.Date(e.PeriodYear, time.Month(e.PeriodMonth), day, 0, 0, 0, 0, time.UTC)
+		date, _ := cardTaggedExtraDate(e)
 		py, pm := paymentPeriodFor(card, date)
 		if py == year && pm == month {
 			out = append(out, e)
