@@ -657,19 +657,27 @@ func windowEndForPeriod(card CreditCard, year, month int) time.Time {
 	return time.Date(y, time.Month(m), card.StatementDay, 0, 0, 0, 0, time.UTC)
 }
 
-// windowStartForPeriod returns the statement-close date that opens payment
-// period (year, month)'s window -- i.e. windowEndForPeriod of the previous
-// payment period. Used as the no-checkpoint decay start for a fresh
-// auto-sundries buffer: GeneratePeriodEntries can materialize a period's
-// buffer well before that period's own window has even opened (Forecast/Grid
-// sweep many consecutive months ahead), so anchoring decay to "today" would
-// make a future period's buffer start decaying before any of its window has
-// elapsed. effectiveEntryAmount already floors weeksElapsed at zero for a
-// decay_start_date still in the future, so a not-yet-open window simply
-// shows the full undecayed amount until it actually opens.
-func windowStartForPeriod(card CreditCard, year, month int) time.Time {
-	py, pm := prevPeriod(year, month)
-	return windowEndForPeriod(card, py, pm)
+// dueDateForPeriod returns the date card's payment is due for payment period
+// (year, month) -- i.e. period_month's own calendar date at PaymentDueDay,
+// clamped to the days actually in that month. Used as the no-checkpoint
+// decay start for a fresh auto-sundries buffer (see GeneratePeriodEntries):
+// the *previous* period's due date is the point spending starts counting
+// toward this period's bill, regardless of whether that previous bill was
+// ever actually marked paid in the app -- in practice it will have been
+// paid around its due date either way. This is also deliberately a fixed,
+// always-computable date rather than one tied to a checkpoint or an
+// incurred_date that might not exist yet: GeneratePeriodEntries can
+// materialize a period's buffer well before that period's own window has
+// even opened (Forecast/Grid sweep many consecutive months ahead), and
+// effectiveEntryAmount already floors weeksElapsed at zero for a
+// decay_start_date still in the future, so a far-future buffer simply shows
+// the full undecayed amount until its anchor date actually arrives.
+func dueDateForPeriod(card CreditCard, year, month int) time.Time {
+	day := card.PaymentDueDay
+	if last := daysInMonth(year, month); day > last {
+		day = last
+	}
+	return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
 }
 
 // proRatedSundries sizes a card's auto-sundries buffer down to just the
@@ -1685,7 +1693,8 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 				return created, cerr
 			}
 			amount := *t.sundriesAmount
-			decayStart := windowStartForPeriod(card, year, month)
+			prevYear, prevMonth := prevPeriod(year, month)
+			decayStart := dueDateForPeriod(card, prevYear, prevMonth)
 			skipInsert := false
 
 			checkpoint, hasCheckpoint, cerr := latestCardCheckpointForPeriod(card, year, month)
@@ -2377,6 +2386,70 @@ func adjustAutoSundriesForCheckpoint(card CreditCard, year, month int) error {
 	_, err = database.Exec(`UPDATE entries SET planned_amount=$2, decay_start_date=$3 WHERE id=$1`,
 		entryID, amount, decayStart)
 	return err
+}
+
+// BackfillSundriesAnchors recomputes decay_start_date for every existing
+// auto-sundries buffer that isn't currently anchored to a real checkpoint
+// (see adjustAutoSundriesForCheckpoint) -- i.e. one created via
+// GeneratePeriodEntries's no-checkpoint path before dueDateForPeriod
+// replaced the old windowStartForPeriod anchor. One-off: run once after
+// deploying that change (e.g. `cashflow -fix-sundries-anchors`) to correct
+// buffers already sitting in the database; a fresh buffer created from here
+// on gets the right anchor the first time, so this never needs running
+// again. Checkpoint-anchored buffers are left untouched -- they're already
+// correct, tied to real data rather than this no-checkpoint guess. Returns
+// how many entries were actually changed.
+func BackfillSundriesAnchors() (int, error) {
+	rows, err := database.Query(`
+		SELECT id, credit_card_id, period_year, period_month, decay_start_date
+		FROM entries WHERE auto_sundries`)
+	if err != nil {
+		return 0, err
+	}
+	type row struct {
+		id             int64
+		cardID         int64
+		year, month    int
+		decayStartDate *time.Time
+	}
+	var toCheck []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.cardID, &r.year, &r.month, &r.decayStartDate); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		toCheck = append(toCheck, r)
+	}
+	rows.Close()
+
+	fixed := 0
+	for _, r := range toCheck {
+		card, err := getCreditCard(r.cardID)
+		if err != nil {
+			return fixed, err
+		}
+		_, hasCheckpoint, err := latestCardCheckpointForPeriod(card, r.year, r.month)
+		if err != nil {
+			return fixed, err
+		}
+		if hasCheckpoint {
+			continue // already anchored to real data -- leave it alone
+		}
+		prevYear, prevMonth := prevPeriod(r.year, r.month)
+		correct := dueDateForPeriod(card, prevYear, prevMonth)
+		if r.decayStartDate != nil && r.decayStartDate.Equal(correct) {
+			continue // already correct
+		}
+		if _, err := database.Exec(`UPDATE entries SET decay_start_date=$2 WHERE id=$1`, r.id, correct); err != nil {
+			return fixed, err
+		}
+		if err := recalculateCardEntry(r.cardID, r.year, r.month); err != nil {
+			return fixed, err
+		}
+		fixed++
+	}
+	return fixed, nil
 }
 
 // ---- Balance checkpoints ----
