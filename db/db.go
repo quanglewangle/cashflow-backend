@@ -2388,6 +2388,70 @@ func adjustAutoSundriesForCheckpoint(card CreditCard, year, month int) error {
 	return err
 }
 
+// BackfillSundriesAnchors recomputes decay_start_date for every existing
+// auto-sundries buffer that isn't currently anchored to a real checkpoint
+// (see adjustAutoSundriesForCheckpoint) -- i.e. one created via
+// GeneratePeriodEntries's no-checkpoint path before dueDateForPeriod
+// replaced the old windowStartForPeriod anchor. One-off: run once after
+// deploying that change (e.g. `cashflow -fix-sundries-anchors`) to correct
+// buffers already sitting in the database; a fresh buffer created from here
+// on gets the right anchor the first time, so this never needs running
+// again. Checkpoint-anchored buffers are left untouched -- they're already
+// correct, tied to real data rather than this no-checkpoint guess. Returns
+// how many entries were actually changed.
+func BackfillSundriesAnchors() (int, error) {
+	rows, err := database.Query(`
+		SELECT id, credit_card_id, period_year, period_month, decay_start_date
+		FROM entries WHERE auto_sundries`)
+	if err != nil {
+		return 0, err
+	}
+	type row struct {
+		id             int64
+		cardID         int64
+		year, month    int
+		decayStartDate *time.Time
+	}
+	var toCheck []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.cardID, &r.year, &r.month, &r.decayStartDate); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		toCheck = append(toCheck, r)
+	}
+	rows.Close()
+
+	fixed := 0
+	for _, r := range toCheck {
+		card, err := getCreditCard(r.cardID)
+		if err != nil {
+			return fixed, err
+		}
+		_, hasCheckpoint, err := latestCardCheckpointForPeriod(card, r.year, r.month)
+		if err != nil {
+			return fixed, err
+		}
+		if hasCheckpoint {
+			continue // already anchored to real data -- leave it alone
+		}
+		prevYear, prevMonth := prevPeriod(r.year, r.month)
+		correct := dueDateForPeriod(card, prevYear, prevMonth)
+		if r.decayStartDate != nil && r.decayStartDate.Equal(correct) {
+			continue // already correct
+		}
+		if _, err := database.Exec(`UPDATE entries SET decay_start_date=$2 WHERE id=$1`, r.id, correct); err != nil {
+			return fixed, err
+		}
+		if err := recalculateCardEntry(r.cardID, r.year, r.month); err != nil {
+			return fixed, err
+		}
+		fixed++
+	}
+	return fixed, nil
+}
+
 // ---- Balance checkpoints ----
 
 func GetCheckpoints() ([]BalanceCheckpoint, error) {

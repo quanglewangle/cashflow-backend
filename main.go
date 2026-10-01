@@ -8,6 +8,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -61,6 +62,9 @@ func intQueryParam(r *http.Request, name string) (int, bool) {
 }
 
 func main() {
+	fixSundriesAnchors := flag.Bool("fix-sundries-anchors", false, "one-off: recompute decay_start_date for existing auto-sundries buffers (see db.BackfillSundriesAnchors), then exit without starting the server")
+	flag.Parse()
+
 	port := os.Getenv("CASHFLOW_PORT")
 	if port == "" {
 		port = "8092"
@@ -68,6 +72,15 @@ func main() {
 	writeToken = os.Getenv("CASHFLOW_WRITE_TOKEN")
 
 	db.OpenDatabase()
+
+	if *fixSundriesAnchors {
+		n, err := db.BackfillSundriesAnchors()
+		if err != nil {
+			log.Fatalf("fix-sundries-anchors: %v", err)
+		}
+		log.Printf("fix-sundries-anchors: updated %d entries", n)
+		return
+	}
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "build": buildHash})
