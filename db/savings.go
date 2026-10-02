@@ -137,7 +137,7 @@ func savingsWalk(a SavingsAccount, endYear, endMonth int) (savingsWalkResult, er
 		return res, err
 	}
 	rows, err := database.Query(`
-		SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date,
+		SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date, decay_end_date,
 		       status, incurred_date, period_year, period_month, COALESCE(due_day, 1)
 		FROM entries
 		WHERE savings_account_id=$1 AND item_type IN ('savings', 'income')`, a.ID)
@@ -150,9 +150,9 @@ func savingsWalk(a SavingsAccount, endYear, endMonth int) (savingsWalkResult, er
 		var itemType, status string
 		var planned float64
 		var actual, decay *float64
-		var decayStart, incurred *time.Time
+		var decayStart, decayEnd, incurred *time.Time
 		var year, month, day int
-		if err := rows.Scan(&itemType, &planned, &actual, &decay, &decayStart,
+		if err := rows.Scan(&itemType, &planned, &actual, &decay, &decayStart, &decayEnd,
 			&status, &incurred, &year, &month, &day); err != nil {
 			return res, err
 		}
@@ -163,7 +163,7 @@ func savingsWalk(a SavingsAccount, endYear, endMonth int) (savingsWalkResult, er
 		if !date.After(opening) {
 			continue // already reflected in the opening balance
 		}
-		amount := effectiveEntryAmount(planned, actual, decay, decayStart)
+		amount := effectiveEntryAmount(planned, actual, decay, decayStart, decayEnd)
 		if itemType == "income" {
 			amount = -amount
 		}
