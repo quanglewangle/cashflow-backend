@@ -796,6 +796,79 @@ func main() {
 		}
 	})
 
+	// GET /holidays lists holidays with their total and what's left of it.
+	// POST /holidays adds one: {credit_card_id, name, start_date, end_date,
+	// per_day}, dates "YYYY-MM-DD" (end inclusive). Each becomes a daily
+	// count-back buffer on that card's bill(s) -- see db/holidays.go.
+	http.HandleFunc("/holidays", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			holidays, err := db.GetHolidays()
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if holidays == nil {
+				holidays = []db.Holiday{}
+			}
+			writeJSON(w, http.StatusOK, holidays)
+		case http.MethodPost:
+			if !okToWrite(w, r) {
+				return
+			}
+			var h db.Holiday
+			if err := json.NewDecoder(r.Body).Decode(&h); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid JSON")
+				return
+			}
+			id, err := db.AddHoliday(h)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+
+	// PUT /holidays/{id} edits a holiday (replacing its buffers).
+	// DELETE /holidays/{id} removes it and its buffers.
+	http.HandleFunc("/holidays/", func(w http.ResponseWriter, r *http.Request) {
+		id, err := idFromPath(strings.TrimSuffix(r.URL.Path, "/"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			if !okToWrite(w, r) {
+				return
+			}
+			var h db.Holiday
+			if err := json.NewDecoder(r.Body).Decode(&h); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid JSON")
+				return
+			}
+			if err := db.UpdateHoliday(id, h); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+		case http.MethodDelete:
+			if !okToWrite(w, r) {
+				return
+			}
+			if err := db.DeleteHoliday(id); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+
 	// GET /checkpoints lists every known-good balance recorded so far.
 	// POST /checkpoints adds (or replaces, if the period already has one)
 	// a checkpoint -- e.g. after checking the real bank app -- which

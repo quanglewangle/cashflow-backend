@@ -34,3 +34,44 @@ func TestCountBackAmount(t *testing.T) {
 		}
 	}
 }
+
+func TestCountBackDailyAmount(t *testing.T) {
+	// A £80/day holiday 10-14 Oct: end is the day after its last day.
+	end := time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
+	at := func(m time.Month, d, h int) time.Time { return time.Date(2026, m, d, h, 0, 0, 0, time.UTC) }
+	cases := []struct {
+		now  time.Time
+		want float64
+	}{
+		{at(10, 1, 9), 400},
+		{at(10, 10, 0), 400},
+		{at(10, 10, 9), 400},
+		{at(10, 11, 9), 320},
+		{at(10, 14, 0), 80},
+		{at(10, 14, 23), 80},
+		{at(10, 15, 0), 0},
+		{at(11, 1, 0), 0},
+	}
+	for _, c := range cases {
+		if got := countBackDailyAmount(400, 80, end, c.now); got != c.want {
+			t.Errorf("countBackDailyAmount(%s) = %v, want %v", c.now.Format("2 Jan 15:04"), got, c.want)
+		}
+	}
+}
+
+func TestDayRange(t *testing.T) {
+	d := func(m time.Month, day int) time.Time { return time.Date(2026, m, day, 0, 0, 0, 0, time.UTC) }
+	cases := []struct {
+		first, last time.Time
+		want        string
+	}{
+		{d(10, 10), d(10, 10), "10 Oct"},
+		{d(10, 10), d(10, 14), "10–14 Oct"},
+		{d(10, 28), d(11, 3), "28 Oct–3 Nov"},
+	}
+	for _, c := range cases {
+		if got := dayRange(c.first, c.last); got != c.want {
+			t.Errorf("dayRange = %q, want %q", got, c.want)
+		}
+	}
+}
