@@ -2487,7 +2487,7 @@ func periodNetFrom(year, month, fromDay int) (income, expense, savings float64, 
 	// a card purely as a label (e.g. a recurring purchase actually paid via
 	// that card) without being the card's own repayment template.
 	var rows *sql.Rows
-	if fromDay <= 1 {
+	if fromDay <= 0 {
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date, decay_end_date
 			FROM entries WHERE period_year=$1 AND period_month=$2
@@ -2669,7 +2669,7 @@ func periodMinBalance(year, month, fromDay, trackMinFromDay int, startBalance fl
 	// sumPurchasesForPeriod/GetCardTaggedExtras instead -- excluded here,
 	// same as periodNetFrom.
 	var rows *sql.Rows
-	if fromDay <= 1 {
+	if fromDay <= 0 {
 		rows, err = database.Query(`
 			SELECT item_type, planned_amount, actual_amount, decay_per_week, decay_start_date, decay_end_date, COALESCE(due_day, 0)
 			FROM entries WHERE period_year=$1 AND period_month=$2
