@@ -91,11 +91,11 @@ type RecurringItem struct {
 	CategoryID    int64    `json:"category_id"`
 	Name          string   `json:"name"`
 	ItemType      string   `json:"item_type"`
-	Frequency     string   `json:"frequency"` // monthly | three_monthly | annual | irregular | four_weekly
+	Frequency     string   `json:"frequency"` // monthly | three_monthly | annual | irregular | four_weekly | weekly
 	DefaultAmount *float64 `json:"default_amount"`
 	DueDay        *int     `json:"due_day"`
 	TargetMonth   *int     `json:"target_month"`
-	AnchorDate    *string  `json:"anchor_date"` // ISO date "YYYY-MM-DD"; monthly: don't generate before this month; four_weekly: reference occurrence
+	AnchorDate    *string  `json:"anchor_date"` // ISO date "YYYY-MM-DD"; monthly: don't generate before this month; four_weekly/weekly: reference occurrence
 	CreditCardID  *int64   `json:"credit_card_id"`
 	Active        bool     `json:"active"`
 	Notes         *string  `json:"notes"`
@@ -1145,9 +1145,9 @@ func UpdateRecurringItem(id int64, r RecurringItem) error {
 	}
 
 	// Propagate due_day change to unpaid entries so their position matches the template.
-	// A four_weekly item's day drifts month to month, so its template due_day is
-	// meaningless for any particular entry -- realign from the anchor instead.
-	if r.Frequency == "four_weekly" && r.AnchorDate != nil {
+	// A four_weekly or weekly item's day drifts month to month, so its template
+	// due_day is meaningless for any particular entry -- realign from the anchor instead.
+	if (r.Frequency == "four_weekly" || r.Frequency == "weekly") && r.AnchorDate != nil {
 		if err := realignFourWeeklyEntries(id); err != nil {
 			return err
 		}
@@ -1585,6 +1585,7 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		    ))
 		    OR (frequency = 'annual' AND target_month = $1)
 		    OR (frequency = 'four_weekly' AND anchor_date IS NOT NULL)
+		    OR (frequency = 'weekly' AND anchor_date IS NOT NULL)
 		    OR (frequency = 'three_monthly' AND anchor_date IS NOT NULL)
 		  )`, month, year)
 	if err != nil {
@@ -1619,7 +1620,7 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 	// the usual recurring_item_id/period key) one occurrence of a template's
 	// entry for (year, month) and backfills due_day on it if it already
 	// existed without one. occurrence_seq is always 0 except for a
-	// four_weekly item's second-or-later occurrence within the same month.
+	// four_weekly or weekly item's second-or-later occurrence within the same month.
 	insertGeneratedEntry := func(t tmpl, occurrenceSeq int, amount float64, dueDay *int) (created int, err error) {
 		res, err := database.Exec(`
 			INSERT INTO entries (recurring_item_id, category_id, period_year, period_month, name, item_type, planned_amount, credit_card_id, due_day, occurrence_seq)
@@ -1664,11 +1665,12 @@ func GeneratePeriodEntries(year, month int) (int, error) {
 		}
 
 		createdThisTemplate := 0
-		if t.frequency == "four_weekly" {
-			// A 28-day cycle can land twice in one calendar month -- each
-			// occurrence gets its own entry (own day, own single-occurrence
-			// amount) instead of being merged into one inflated, single-day row.
-			days := fourWeeklyDaysInMonth(*t.anchorDate, year, month)
+		if t.frequency == "four_weekly" || t.frequency == "weekly" {
+			// A 28-day cycle can land twice in one calendar month, a 7-day
+			// one four or five times -- each occurrence gets its own entry
+			// (own day, own single-occurrence amount) instead of being merged
+			// into one inflated, single-day row.
+			days := cycleDaysInMonth(*t.anchorDate, cycleLengthDays(t.frequency), year, month)
 			if len(days) == 0 {
 				continue // this cycle's 28-day drift means not every month gets one
 			}
@@ -1882,22 +1884,37 @@ func threeMonthlyFires(anchor time.Time, year, month int) bool {
 	return diff >= 0 && diff%3 == 0
 }
 
+// cycleLengthDays is the step between occurrences of a fixed-cycle frequency
+// (four_weekly or weekly), anchored to a known occurrence date.
+func cycleLengthDays(frequency string) int {
+	if frequency == "weekly" {
+		return 7
+	}
+	return 28
+}
+
 // fourWeeklyDaysInMonth returns the day-of-month of every anchor+28*k
 // occurrence (k=0,1,2,...) that lands within calendar month (year, month), in
 // order. A 28-day cycle is ~13 occurrences a year, not 12, so it drifts
 // against calendar months: most months get exactly one, occasionally one
-// gets two (when the drift "catches up") or none. The loop is bounded -- at
-// most 31 days in a month / 28-day step can ever produce more than 2
-// occurrences, so 4 iterations is generous, not a risk of runaway (this
-// codebase has already had one of those). Mirrors the Android client's own
-// Util.fourWeeklyDaysInMonth, used there for display purposes only.
+// gets two (when the drift "catches up") or none.
 func fourWeeklyDaysInMonth(anchor time.Time, year, month int) []int {
+	return cycleDaysInMonth(anchor, 28, year, month)
+}
+
+// cycleDaysInMonth returns the day-of-month of every anchor+step*k occurrence
+// (k=0,1,2,...) that lands within calendar month (year, month), in order. The
+// loop is bounded -- a 31-day month holds at most 31/step+1 occurrences, so
+// 31/step+2 iterations is generous, not a risk of runaway (this codebase has
+// already had one of those). Mirrors the Android client's own
+// Util.cycleDaysInMonth, used there for display purposes only.
+func cycleDaysInMonth(anchor time.Time, step, year, month int) []int {
 	monthStart := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
 	monthEnd := monthStart.AddDate(0, 1, 0)
 
 	diffDays := int(monthStart.Sub(anchor).Hours() / 24)
-	k := diffDays / 28
-	if diffDays%28 != 0 && diffDays > 0 {
+	k := diffDays / step
+	if diffDays%step != 0 && diffDays > 0 {
 		k++ // round up to the first occurrence on/after monthStart
 	}
 	if k < 0 {
@@ -1905,8 +1922,8 @@ func fourWeeklyDaysInMonth(anchor time.Time, year, month int) []int {
 	}
 
 	var days []int
-	for i := 0; i < 4; i++ {
-		occ := anchor.AddDate(0, 0, 28*(k+i))
+	for i := 0; i < 31/step+2; i++ {
+		occ := anchor.AddDate(0, 0, step*(k+i))
 		if !occ.Before(monthStart) && occ.Before(monthEnd) {
 			days = append(days, occ.Day())
 		}
@@ -1917,7 +1934,7 @@ func fourWeeklyDaysInMonth(anchor time.Time, year, month int) []int {
 	return days
 }
 
-// realignFourWeeklyEntries resets every unpaid entry of four_weekly item id to
+// realignFourWeeklyEntries resets every unpaid entry of four_weekly (or weekly) item id to
 // the occurrence days its anchor_date actually gives for that entry's month:
 // occurrence_seq N gets the Nth day, a month the drift now gives an extra
 // occurrence gets a new entry, and an unpaid entry for an occurrence that no
@@ -1933,11 +1950,12 @@ func realignFourWeeklyEntries(id int64) error {
 		defaultAmount *float64
 		anchorDate    time.Time
 		creditCardID  *int64
+		frequency     string
 	}
 	if err := database.QueryRow(`
-		SELECT category_id, name, item_type, default_amount, anchor_date, credit_card_id
+		SELECT category_id, name, item_type, default_amount, anchor_date, credit_card_id, frequency
 		FROM recurring_items WHERE id = $1 AND anchor_date IS NOT NULL`, id).
-		Scan(&t.categoryID, &t.name, &t.itemType, &t.defaultAmount, &t.anchorDate, &t.creditCardID); err != nil {
+		Scan(&t.categoryID, &t.name, &t.itemType, &t.defaultAmount, &t.anchorDate, &t.creditCardID, &t.frequency); err != nil {
 		return err
 	}
 	amount := 0.0
@@ -1964,7 +1982,7 @@ func realignFourWeeklyEntries(id int64) error {
 	rows.Close()
 
 	for _, p := range periods {
-		days := fourWeeklyDaysInMonth(t.anchorDate, p.year, p.month)
+		days := cycleDaysInMonth(t.anchorDate, cycleLengthDays(t.frequency), p.year, p.month)
 		for seq, day := range days {
 			if _, err := database.Exec(`
 				UPDATE entries SET due_day = $1

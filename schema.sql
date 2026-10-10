@@ -8,7 +8,7 @@
 --   psql cashflow -f schema.sql
 
 CREATE TYPE item_type AS ENUM ('income', 'expense', 'savings');
-CREATE TYPE item_frequency AS ENUM ('monthly', 'annual', 'irregular', 'four_weekly');
+CREATE TYPE item_frequency AS ENUM ('monthly', 'annual', 'irregular', 'four_weekly', 'three_monthly', 'last_working_day', 'weekly');
 CREATE TYPE entry_status AS ENUM ('planned', 'incurred');
 
 -- One row per physical credit card. statement_day/payment_due_day are

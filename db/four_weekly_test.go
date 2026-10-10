@@ -76,3 +76,35 @@ func TestFourWeeklyOccurrencesNoInfiniteLoop(t *testing.T) {
 		t.Errorf("anchor far in the past: got %d, want 0-2", got)
 	}
 }
+
+func TestWeeklyOccurrences(t *testing.T) {
+	anchor := date("2026-01-05") // a Monday
+
+	cases := []struct {
+		year, month int
+		want        []int
+	}{
+		{2025, 12, nil},                 // before the anchor starts at all
+		{2026, 1, []int{5, 12, 19, 26}}, // the anchor's own month
+		{2026, 3, []int{2, 9, 16, 23, 30}},
+		{2026, 2, []int{2, 9, 16, 23}},
+	}
+	for _, c := range cases {
+		got := cycleDaysInMonth(anchor, 7, c.year, c.month)
+		if len(got) != len(c.want) {
+			t.Errorf("%d-%02d: got %v, want %v", c.year, c.month, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("%d-%02d: got %v, want %v", c.year, c.month, got, c.want)
+				break
+			}
+		}
+	}
+
+	// An anchor long in the past still gives every Monday of the month.
+	if got := cycleDaysInMonth(date("1990-01-01"), 7, 2026, 6); len(got) != 5 {
+		t.Errorf("anchor far in the past: got %v, want 5 Mondays", got)
+	}
+}
