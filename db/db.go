@@ -2437,7 +2437,11 @@ func adjustAutoSundriesForCheckpoint(card CreditCard, year, month int) error {
 		return err
 	}
 	if !hasCheckpoint {
-		return nil // nothing to recompute against -- leave the buffer as-is
+		// The period's last checkpoint was just deleted: put the buffer back
+		// to the full, un-prorated size GeneratePeriodEntries would have
+		// created, rather than leaving it sized for a checkpoint that no
+		// longer exists.
+		return restoreFullAutoSundries(card, year, month, entryID)
 	}
 	checkpointDate := time.Date(checkpoint.PeriodYear, time.Month(checkpoint.PeriodMonth), checkpoint.PeriodDay, 0, 0, 0, 0, time.UTC)
 	amount, decayStart, ok := proRatedSundries(card, year, month, decayPerWeek, checkpointDate)
@@ -2447,6 +2451,29 @@ func adjustAutoSundriesForCheckpoint(card CreditCard, year, month int) error {
 	}
 	_, err = database.Exec(`UPDATE entries SET planned_amount=$2, decay_start_date=$3, decay_end_date=$4 WHERE id=$1`,
 		entryID, amount, decayStart, windowEndForPeriod(card, year, month))
+	return err
+}
+
+// restoreFullAutoSundries resets an auto-sundries buffer to the card's
+// current sundries_amount/sundries_decay_per_week over the whole statement
+// window, as GeneratePeriodEntries sizes one with no checkpoint. No-op if
+// the card no longer has sundries configured.
+func restoreFullAutoSundries(card CreditCard, year, month int, entryID int64) error {
+	var amount sql.NullFloat64
+	var decayPerWeek *float64
+	err := database.QueryRow(`
+		SELECT sundries_amount, sundries_decay_per_week FROM recurring_items
+		WHERE credit_card_id = $1 AND active = TRUE AND sundries_amount IS NOT NULL
+		ORDER BY id LIMIT 1`, card.ID,
+	).Scan(&amount, &decayPerWeek)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, err = database.Exec(`UPDATE entries SET planned_amount=$2, decay_per_week=$3, decay_start_date=$4, decay_end_date=$5 WHERE id=$1`,
+		entryID, amount.Float64, decayPerWeek, windowStartForPeriod(card, year, month), windowEndForPeriod(card, year, month))
 	return err
 }
 
