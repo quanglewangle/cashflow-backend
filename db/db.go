@@ -428,6 +428,46 @@ func purchasePaymentPeriod(card CreditCard, purchaseDate time.Time, amount float
 	return py, pm, nil
 }
 
+// priorBillRefundsAfter sums refunds that purchasePaymentPeriod moved onto
+// the prior payment period (year, month) but that are dated after
+// checkpointDate. sumUnpaidPriorCardBills nets that prior bill out of a
+// later checkpoint's balance on the basis that the bill is baked into it --
+// but these refunds post after the checkpoint, so they're in the bill and
+// not the balance, and must be added back or they'd be counted twice.
+func priorBillRefundsAfter(card CreditCard, year, month int, checkpointDate time.Time) (float64, error) {
+	rows, err := database.Query(`
+		SELECT amount, purchase_date FROM card_purchases
+		WHERE credit_card_id = $1 AND amount < 0 AND purchase_date > $2`, card.ID, checkpointDate)
+	if err != nil {
+		return 0, err
+	}
+	type refund struct {
+		amount float64
+		date   time.Time
+	}
+	var refunds []refund
+	for rows.Next() {
+		var r refund
+		if err := rows.Scan(&r.amount, &r.date); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		refunds = append(refunds, r)
+	}
+	rows.Close()
+	var total float64
+	for _, r := range refunds {
+		py, pm, err := purchasePaymentPeriod(card, r.date, r.amount)
+		if err != nil {
+			return 0, err
+		}
+		if py == year && pm == month {
+			total += r.amount
+		}
+	}
+	return total, nil
+}
+
 // recalculatePurchasePeriod recalculates the payment period a purchase is
 // attributed to. A refund moved onto a prior bill also shifts every later
 // period of the card, since each nets the prior bill out of its checkpoint
@@ -629,11 +669,18 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 			// yet -- that amount is already baked into checkpoint.Balance, but it's
 			// also counted on its own as that earlier period's entry, so leaving it
 			// in here would double it. Net it back out.
-			_, unpaidPrior, err := sumUnpaidPriorCardBills(cardID, year, month, afterDate)
+			prior, unpaidPrior, err := sumUnpaidPriorCardBills(cardID, year, month, afterDate)
 			if err != nil {
 				return 0, false, 0, err
 			}
 			total -= unpaidPrior
+			if prior != nil {
+				refunds, err := priorBillRefundsAfter(card, prior.PeriodYear, prior.PeriodMonth, afterDate)
+				if err != nil {
+					return 0, false, 0, err
+				}
+				total += refunds
+			}
 		}
 
 		rows, err := database.Query(`
@@ -935,6 +982,11 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 			if entry != nil {
 				result.UnpaidPriorBill = entry
 				result.Total -= unpaidAmount
+				refunds, err := priorBillRefundsAfter(card, entry.PeriodYear, entry.PeriodMonth, afterDate)
+				if err != nil {
+					return CardPaymentBreakdown{}, err
+				}
+				result.Total += refunds
 			}
 		}
 

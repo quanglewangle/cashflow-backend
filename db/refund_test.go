@@ -10,9 +10,9 @@ func TestRefundPriorPeriod(t *testing.T) {
 	card := CreditCard{StatementDay: 14, PaymentDueDay: 9, PaymentDueMonthOffset: 1}
 	day := func(y int, m time.Month, d int) time.Time { return time.Date(y, m, d, 0, 0, 0, 0, time.UTC) }
 	cases := []struct {
-		date        time.Time
+		date         time.Time
 		wantY, wantM int
-		wantOK      bool
+		wantOK       bool
 	}{
 		// After the 14 Oct statement, before its 9 Nov payment: comes off November's bill.
 		{day(2026, 10, 15), 2026, 11, true},
