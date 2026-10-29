@@ -374,6 +374,78 @@ func paymentPeriodFor(card CreditCard, purchaseDate time.Time) (year, month int)
 	return year, month
 }
 
+// refundPriorPeriod reports the earlier payment period a refund dated
+// refundDate could instead come off: the statement just before the one it
+// posts to, whose bill is still awaiting payment until that period's
+// payment_due_day. A refund landing in that gap reduces what you need to
+// pay to clear the card, so it's netted from that earlier bill rather than
+// waiting a whole extra cycle. ok is false once that due date has passed.
+func refundPriorPeriod(card CreditCard, refundDate time.Time) (year, month int, ok bool) {
+	year, month = prevPeriod(paymentPeriodFor(card, refundDate))
+	day := card.PaymentDueDay
+	if last := daysInMonth(year, month); day > last {
+		day = last
+	}
+	due := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+	return year, month, !refundDate.After(due)
+}
+
+// purchasePaymentPeriod is paymentPeriodFor for a logged card purchase:
+// identical, except a refund (negative amount) on a pay-in-full card moves
+// back onto the prior bill when it arrives before that bill is due and
+// before it's actually been paid (see refundPriorPeriod). Once that bill is
+// paid the refund can only show up on the next one, which is what the
+// checkpoint netting in sumPurchasesForPeriod then expects.
+func purchasePaymentPeriod(card CreditCard, purchaseDate time.Time, amount float64) (year, month int, err error) {
+	year, month = paymentPeriodFor(card, purchaseDate)
+	if amount >= 0 || card.CarriesBalance {
+		return year, month, nil
+	}
+	py, pm, ok := refundPriorPeriod(card, purchaseDate)
+	if !ok {
+		return year, month, nil
+	}
+	item, found, err := recurringItemForCard(card.ID)
+	if err != nil || !found {
+		return year, month, err
+	}
+	var status string
+	var incurredDate *time.Time
+	err = database.QueryRow(`
+		SELECT status, incurred_date FROM entries
+		WHERE recurring_item_id = $1 AND period_year = $2 AND period_month = $3`,
+		item.id, py, pm,
+	).Scan(&status, &incurredDate)
+	if err == sql.ErrNoRows {
+		return year, month, nil
+	}
+	if err != nil {
+		return year, month, err
+	}
+	if status == "incurred" && (incurredDate == nil || !incurredDate.After(purchaseDate)) {
+		return year, month, nil
+	}
+	return py, pm, nil
+}
+
+// recalculatePurchasePeriod recalculates the payment period a purchase is
+// attributed to. A refund moved onto a prior bill also shifts every later
+// period of the card, since each nets the prior bill out of its checkpoint
+// (see sumUnpaidPriorCardBills), so those are recalculated too.
+func recalculatePurchasePeriod(card CreditCard, purchaseDate time.Time, amount float64) error {
+	year, month, err := purchasePaymentPeriod(card, purchaseDate, amount)
+	if err != nil {
+		return err
+	}
+	if err := recalculateCardEntry(card.ID, year, month); err != nil {
+		return err
+	}
+	if amount >= 0 {
+		return nil
+	}
+	return recalculateLaterCardEntries(card.ID, year, month)
+}
+
 // recurringItemForCard finds the (single, expected) monthly recurring item
 // that represents this card's payment, so its generated entry can be kept
 // in sync with actual purchases -- and so there's a default_amount to fall
@@ -578,7 +650,10 @@ func sumPurchasesForPeriod(cardID int64, year, month int) (total float64, hasDat
 			if err := rows.Scan(&amount, &purchaseDate, &recurringPurchaseID); err != nil {
 				return 0, false, 0, err
 			}
-			py, pm := paymentPeriodFor(card, purchaseDate)
+			py, pm, err := purchasePaymentPeriod(card, purchaseDate, amount)
+			if err != nil {
+				return 0, false, 0, err
+			}
 			if py != year || pm != month {
 				continue
 			}
@@ -878,7 +953,10 @@ func GetCardPaymentBreakdown(cardID int64, year, month int) (CardPaymentBreakdow
 			if err := rows.Scan(&p.ID, &p.CreditCardID, &p.Description, &p.Amount, &p.PurchaseDate, &p.RecurringPurchaseID, &p.CategoryID); err != nil {
 				return CardPaymentBreakdown{}, err
 			}
-			py, pm := paymentPeriodFor(card, p.PurchaseDate)
+			py, pm, err := purchasePaymentPeriod(card, p.PurchaseDate, p.Amount)
+			if err != nil {
+				return CardPaymentBreakdown{}, err
+			}
 			if py != year || pm != month {
 				continue
 			}
@@ -989,8 +1067,7 @@ func AddCardPurchase(p CardPurchase) (int64, error) {
 	if err != nil {
 		return id, err
 	}
-	year, month := paymentPeriodFor(card, p.PurchaseDate)
-	return id, recalculateCardEntry(p.CreditCardID, year, month)
+	return id, recalculatePurchasePeriod(card, p.PurchaseDate, p.Amount)
 }
 
 // UpdateCardPurchase edits a (manually-added) purchase's description/amount/
@@ -999,8 +1076,9 @@ func AddCardPurchase(p CardPurchase) (int64, error) {
 func UpdateCardPurchase(id int64, p CardPurchase) error {
 	var oldCardID int64
 	var oldDate time.Time
-	err := database.QueryRow(`SELECT credit_card_id, purchase_date FROM card_purchases WHERE id=$1`, id).
-		Scan(&oldCardID, &oldDate)
+	var oldAmount float64
+	err := database.QueryRow(`SELECT credit_card_id, purchase_date, amount FROM card_purchases WHERE id=$1`, id).
+		Scan(&oldCardID, &oldDate, &oldAmount)
 	if err != nil {
 		return err
 	}
@@ -1016,23 +1094,18 @@ func UpdateCardPurchase(id int64, p CardPurchase) error {
 	if err != nil {
 		return err
 	}
-	oldYear, oldMonth := paymentPeriodFor(oldCard, oldDate)
-	if err := recalculateCardEntry(oldCardID, oldYear, oldMonth); err != nil {
+	if err := recalculatePurchasePeriod(oldCard, oldDate, oldAmount); err != nil {
 		return err
 	}
-
-	newYear, newMonth := paymentPeriodFor(oldCard, p.PurchaseDate)
-	if newYear == oldYear && newMonth == oldMonth {
-		return nil
-	}
-	return recalculateCardEntry(oldCardID, newYear, newMonth)
+	return recalculatePurchasePeriod(oldCard, p.PurchaseDate, p.Amount)
 }
 
 func DeleteCardPurchase(id int64) error {
 	var cardID int64
 	var purchaseDate time.Time
-	err := database.QueryRow(`SELECT credit_card_id, purchase_date FROM card_purchases WHERE id=$1`, id).
-		Scan(&cardID, &purchaseDate)
+	var amount float64
+	err := database.QueryRow(`SELECT credit_card_id, purchase_date, amount FROM card_purchases WHERE id=$1`, id).
+		Scan(&cardID, &purchaseDate, &amount)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -1048,8 +1121,7 @@ func DeleteCardPurchase(id int64) error {
 	if err != nil {
 		return err
 	}
-	year, month := paymentPeriodFor(card, purchaseDate)
-	return recalculateCardEntry(cardID, year, month)
+	return recalculatePurchasePeriod(card, purchaseDate, amount)
 }
 
 // ---- Recurring items (templates) ----
