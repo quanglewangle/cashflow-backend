@@ -1119,7 +1119,10 @@ func AddCardPurchase(p CardPurchase) (int64, error) {
 	if err != nil {
 		return id, err
 	}
-	return id, recalculatePurchasePeriod(card, p.PurchaseDate, p.Amount)
+	if err := recalculatePurchasePeriod(card, p.PurchaseDate, p.Amount); err != nil {
+		return id, err
+	}
+	return id, refreshPresentsIfCategory(p.CategoryID)
 }
 
 // UpdateCardPurchase edits a (manually-added) purchase's description/amount/
@@ -1129,8 +1132,9 @@ func UpdateCardPurchase(id int64, p CardPurchase) error {
 	var oldCardID int64
 	var oldDate time.Time
 	var oldAmount float64
-	err := database.QueryRow(`SELECT credit_card_id, purchase_date, amount FROM card_purchases WHERE id=$1`, id).
-		Scan(&oldCardID, &oldDate, &oldAmount)
+	var oldCategoryID *int64
+	err := database.QueryRow(`SELECT credit_card_id, purchase_date, amount, category_id FROM card_purchases WHERE id=$1`, id).
+		Scan(&oldCardID, &oldDate, &oldAmount, &oldCategoryID)
 	if err != nil {
 		return err
 	}
@@ -1149,15 +1153,19 @@ func UpdateCardPurchase(id int64, p CardPurchase) error {
 	if err := recalculatePurchasePeriod(oldCard, oldDate, oldAmount); err != nil {
 		return err
 	}
-	return recalculatePurchasePeriod(oldCard, p.PurchaseDate, p.Amount)
+	if err := recalculatePurchasePeriod(oldCard, p.PurchaseDate, p.Amount); err != nil {
+		return err
+	}
+	return refreshPresentsIfCategory(oldCategoryID, p.CategoryID)
 }
 
 func DeleteCardPurchase(id int64) error {
 	var cardID int64
 	var purchaseDate time.Time
 	var amount float64
-	err := database.QueryRow(`SELECT credit_card_id, purchase_date, amount FROM card_purchases WHERE id=$1`, id).
-		Scan(&cardID, &purchaseDate, &amount)
+	var categoryID *int64
+	err := database.QueryRow(`SELECT credit_card_id, purchase_date, amount, category_id FROM card_purchases WHERE id=$1`, id).
+		Scan(&cardID, &purchaseDate, &amount, &categoryID)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -1173,7 +1181,10 @@ func DeleteCardPurchase(id int64) error {
 	if err != nil {
 		return err
 	}
-	return recalculatePurchasePeriod(card, purchaseDate, amount)
+	if err := recalculatePurchasePeriod(card, purchaseDate, amount); err != nil {
+		return err
+	}
+	return refreshPresentsIfCategory(categoryID)
 }
 
 // ---- Recurring items (templates) ----
@@ -2263,14 +2274,15 @@ func AddCardCheckpoint(creditCardID int64, year, month, day int, balance float64
 // tagged with this card for the given payment period -- other than holiday
 // buffers, which a checkpoint never makes redundant (their days still to
 // come aren't on the card yet, and the days already spent have counted
-// back out of the buffer).
+// back out of the buffer), and present allowances, which only ever hold
+// what hasn't been spent yet.
 func GetCardTaggedOneOffs(cardID int64, year, month int) ([]Entry, error) {
 	rows, err := database.Query(`
 		SELECT id, recurring_item_id, category_id, period_year, period_month,
 		       name, item_type, planned_amount, actual_amount, status, credit_card_id, due_day,
 		       decay_per_week, decay_start_date, decay_end_date, auto_sundries, decay_per_day, holiday_id
 		FROM entries WHERE credit_card_id = $1 AND recurring_item_id IS NULL
-		AND period_year = $2 AND period_month = $3 AND holiday_id IS NULL
+		AND period_year = $2 AND period_month = $3 AND holiday_id IS NULL AND present_occasion_id IS NULL
 		ORDER BY due_day NULLS LAST, id`, cardID, year, month)
 	if err != nil {
 		return nil, err

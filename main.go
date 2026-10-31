@@ -796,6 +796,79 @@ func main() {
 		}
 	})
 
+	// GET /present-occasions lists the yearly present allowances, each with
+	// its next date and what's been spent toward it (Presents-category card
+	// purchases since the previous occasion), what's left, and an overspent
+	// flag. POST adds one: {credit_card_id, name, month, day, allowance}.
+	// What's left is held back on that card's bills -- see db/presents.go.
+	http.HandleFunc("/present-occasions", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			occasions, err := db.GetPresentOccasions()
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if occasions == nil {
+				occasions = []db.PresentOccasion{}
+			}
+			writeJSON(w, http.StatusOK, occasions)
+		case http.MethodPost:
+			if !okToWrite(w, r) {
+				return
+			}
+			var o db.PresentOccasion
+			if err := json.NewDecoder(r.Body).Decode(&o); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid JSON")
+				return
+			}
+			id, err := db.AddPresentOccasion(o)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+
+	// PUT /present-occasions/{id} edits one; DELETE removes it and what it holds back.
+	http.HandleFunc("/present-occasions/", func(w http.ResponseWriter, r *http.Request) {
+		id, err := idFromPath(strings.TrimSuffix(r.URL.Path, "/"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid id")
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			if !okToWrite(w, r) {
+				return
+			}
+			var o db.PresentOccasion
+			if err := json.NewDecoder(r.Body).Decode(&o); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid JSON")
+				return
+			}
+			if err := db.UpdatePresentOccasion(id, o); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+		case http.MethodDelete:
+			if !okToWrite(w, r) {
+				return
+			}
+			if err := db.DeletePresentOccasion(id); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+
 	// GET /holidays lists holidays with their total and what's left of it.
 	// POST /holidays adds one: {credit_card_id, name, start_date, end_date,
 	// per_day}, dates "YYYY-MM-DD" (end inclusive). Each becomes a daily
