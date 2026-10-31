@@ -14,7 +14,9 @@ import (
 // A present occasion is a yearly gift allowance -- Christmas, or a cluster
 // of birthdays -- on a card (see migration 023). Card purchases in the
 // "Presents" category count toward the next occasion on or after their
-// date, whichever card they're on. What's left of the allowance is held
+// date, whichever card they're on -- and so do cash/bank expense entries in
+// that category (a bank transfer to someone, say), dated by when they were
+// paid or are due. What's left of the allowance is held
 // back on the occasion's card bills, spread evenly by day from today (or
 // the day after the previous occasion, if later) up to the occasion
 // itself, so the bills the shopping will actually land on carry it. The
@@ -137,17 +139,88 @@ func presentPurchases() ([]presentPurchase, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []presentPurchase
 	for rows.Next() {
 		var p presentPurchase
 		if err := rows.Scan(&p.amount, &p.date); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		p.date = time.Date(p.date.Year(), p.date.Month(), p.date.Day(), 0, 0, 0, 0, time.UTC)
 		out = append(out, p)
 	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Cash/bank entries in the category: the actual amount once paid, else
+	// the planned one; dated by incurred_date if recorded, else the due day
+	// (the 1st if none).
+	rows, err = database.Query(`
+		SELECT COALESCE(actual_amount, planned_amount), incurred_date, period_year, period_month, due_day
+		FROM entries
+		WHERE category_id=$1 AND credit_card_id IS NULL AND item_type='expense' AND present_occasion_id IS NULL`, catID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var amount float64
+		var incurred *time.Time
+		var year, month int
+		var dueDay *int
+		if err := rows.Scan(&amount, &incurred, &year, &month, &dueDay); err != nil {
+			return nil, err
+		}
+		out = append(out, presentPurchase{amount: amount, date: entryPresentDate(incurred, year, month, dueDay)})
+	}
 	return out, rows.Err()
+}
+
+// entryPresentDate is the day a cash entry counts toward an occasion on.
+func entryPresentDate(incurred *time.Time, year, month int, dueDay *int) time.Time {
+	if incurred != nil {
+		return time.Date(incurred.Year(), incurred.Month(), incurred.Day(), 0, 0, 0, 0, time.UTC)
+	}
+	day := 1
+	if dueDay != nil {
+		day = *dueDay
+	}
+	return occasionDate(month, day, year)
+}
+
+func entryCategoryID(id int64) *int64 {
+	var c *int64
+	_ = database.QueryRow(`SELECT category_id FROM entries WHERE id=$1`, id).Scan(&c)
+	return c
+}
+
+// AddEntry, UpdateEntry and DeleteEntry wrap the entry CRUD so a cash entry
+// in the Presents category moving, changing or going away refreshes the
+// present holds.
+func AddEntry(e Entry) (int64, error) {
+	id, err := addEntry(e)
+	if err != nil {
+		return id, err
+	}
+	return id, refreshPresentsIfCategory(entryCategoryID(id))
+}
+
+func UpdateEntry(id int64, e Entry) error {
+	old := entryCategoryID(id)
+	if err := updateEntry(id, e); err != nil {
+		return err
+	}
+	return refreshPresentsIfCategory(old, entryCategoryID(id))
+}
+
+func DeleteEntry(id int64) error {
+	old := entryCategoryID(id)
+	if err := deleteEntry(id); err != nil {
+		return err
+	}
+	return refreshPresentsIfCategory(old)
 }
 
 func loadPresentOccasions() ([]PresentOccasion, error) {

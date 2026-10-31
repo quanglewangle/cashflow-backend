@@ -120,3 +120,17 @@ func TestOccasionDateClampsLeapDay(t *testing.T) {
 		t.Errorf("29 Feb 2027 = %v, want the 28th", got)
 	}
 }
+
+func TestEntryPresentDate(t *testing.T) {
+	paid := time.Date(2026, 12, 3, 15, 0, 0, 0, time.UTC)
+	if got := entryPresentDate(&paid, 2026, 12, nil); !got.Equal(time.Date(2026, 12, 3, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("incurred date: got %v", got)
+	}
+	day := 31
+	if got := entryPresentDate(nil, 2027, 2, &day); got.Day() != 28 {
+		t.Errorf("due day clamped: got %v", got)
+	}
+	if got := entryPresentDate(nil, 2026, 11, nil); got.Day() != 1 {
+		t.Errorf("no due day: got %v", got)
+	}
+}

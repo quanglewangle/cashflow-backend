@@ -1488,7 +1488,7 @@ func GetEntries(year, month int) ([]Entry, error) {
 	return out, nil
 }
 
-func AddEntry(e Entry) (int64, error) {
+func addEntry(e Entry) (int64, error) {
 	if e.DecayPerWeek != nil && e.DecayStartDate == nil {
 		today := time.Now().Truncate(24 * time.Hour)
 		e.DecayStartDate = &today
@@ -1522,7 +1522,7 @@ func AddEntry(e Entry) (int64, error) {
 	return id, nil
 }
 
-func UpdateEntry(id int64, e Entry) error {
+func updateEntry(id int64, e Entry) error {
 	// If decay is being turned on (or the client omitted the field while it's
 	// already running) without a start date, don't silently disable decay --
 	// fall back to whatever's already stored, or today if this is genuinely new.
@@ -1670,7 +1670,7 @@ func recalculateLaterCardEntries(cardID int64, year, month int) error {
 	return nil
 }
 
-func DeleteEntry(id int64) error {
+func deleteEntry(id int64) error {
 	var recurringItemID *int64
 	var creditCardID *int64
 	var periodYear, periodMonth int
