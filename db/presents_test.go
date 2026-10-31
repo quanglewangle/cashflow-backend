@@ -81,6 +81,40 @@ func TestPresentHolds(t *testing.T) {
 	}
 }
 
+func TestPresentHoldsShopStart(t *testing.T) {
+	visa := CreditCard{ID: 1, StatementDay: 14, PaymentDueMonthOffset: 1}
+	cards := map[int64]CreditCard{1: visa}
+	d := func(y int, m time.Month, day int) time.Time { return time.Date(y, m, day, 0, 0, 0, 0, time.UTC) }
+	nov, first := 11, 1
+	dec, dec1 := 12, 1
+	xmas := PresentOccasion{ID: 1, CreditCardID: 1, Name: "Christmas", Month: 12, Day: 25, Allowance: 500,
+		ShopStartMonth: &nov, ShopStartDay: &first}
+	bdays := PresentOccasion{ID: 2, CreditCardID: 1, Name: "Birthdays", Month: 1, Day: 20, Allowance: 500,
+		ShopStartMonth: &dec, ShopStartDay: &dec1} // before Christmas: the previous occasion still wins
+	holds := presentHolds([]PresentOccasion{xmas, bdays}, cards, nil, d(2026, 10, 1))
+
+	for _, h := range holds {
+		if h.occasionID == 1 && h.first.Year() == 2026 && h.first.Before(d(2026, 11, 1)) {
+			t.Errorf("Christmas 2026 held before 1 Nov: %+v", h)
+		}
+		if h.occasionID == 1 && h.first.Year() == 2027 && h.first.Before(d(2027, 11, 1)) {
+			t.Errorf("Christmas 2027 held before 1 Nov: %+v", h)
+		}
+		if h.occasionID == 2 && h.first.Before(d(2026, 12, 26)) {
+			t.Errorf("Birthdays held before Christmas: %+v", h)
+		}
+	}
+	var xmas26 float64
+	for _, h := range holds {
+		if h.occasionID == 1 && h.last.Year() == 2026 {
+			xmas26 += h.amount
+		}
+	}
+	if math.Abs(xmas26-500) > 0.001 {
+		t.Errorf("Christmas 2026 total = %v, want 500", xmas26)
+	}
+}
+
 func TestOccasionDateClampsLeapDay(t *testing.T) {
 	if got := occasionDate(2, 29, 2027); got.Day() != 28 {
 		t.Errorf("29 Feb 2027 = %v, want the 28th", got)

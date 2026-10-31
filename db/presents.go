@@ -36,6 +36,10 @@ type PresentOccasion struct {
 	Month        int     `json:"month"`
 	Day          int     `json:"day"`
 	Allowance    float64 `json:"allowance"`
+	// Optional: when shopping for it starts each year. What's left is held
+	// back from then (or today) rather than from the previous occasion.
+	ShopStartMonth *int `json:"shop_start_month"`
+	ShopStartDay   *int `json:"shop_start_day"`
 	// Computed at read time for the next occurrence (on or after today).
 	NextDate  string  `json:"next_date"` // "YYYY-MM-DD"
 	Spent     float64 `json:"spent"`
@@ -86,6 +90,20 @@ func presentOccurrences(occasions []PresentOccasion, from time.Time) []occurrenc
 	return out
 }
 
+// shopStart is when shopping for the occurrence on date starts: the last
+// shop_start day/month on or before it (so a 1 Dec start for a 20 Jan
+// occasion is the December before). ok is false if none is set.
+func shopStart(o PresentOccasion, date time.Time) (time.Time, bool) {
+	if o.ShopStartMonth == nil || o.ShopStartDay == nil {
+		return time.Time{}, false
+	}
+	start := occasionDate(*o.ShopStartMonth, *o.ShopStartDay, date.Year())
+	if start.After(date) {
+		start = occasionDate(*o.ShopStartMonth, *o.ShopStartDay, date.Year()-1)
+	}
+	return start, true
+}
+
 type presentPurchase struct {
 	amount float64
 	date   time.Time
@@ -134,7 +152,7 @@ func presentPurchases() ([]presentPurchase, error) {
 
 func loadPresentOccasions() ([]PresentOccasion, error) {
 	rows, err := database.Query(`
-		SELECT id, credit_card_id, name, month, day, allowance FROM present_occasions ORDER BY month, day, id`)
+		SELECT id, credit_card_id, name, month, day, allowance, shop_start_month, shop_start_day FROM present_occasions ORDER BY month, day, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +160,7 @@ func loadPresentOccasions() ([]PresentOccasion, error) {
 	var out []PresentOccasion
 	for rows.Next() {
 		var o PresentOccasion
-		if err := rows.Scan(&o.ID, &o.CreditCardID, &o.Name, &o.Month, &o.Day, &o.Allowance); err != nil {
+		if err := rows.Scan(&o.ID, &o.CreditCardID, &o.Name, &o.Month, &o.Day, &o.Allowance, &o.ShopStartMonth, &o.ShopStartDay); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -201,6 +219,17 @@ func validatePresentOccasion(o PresentOccasion) error {
 	if o.Allowance <= 0 {
 		return errors.New("allowance must be more than zero")
 	}
+	if (o.ShopStartMonth == nil) != (o.ShopStartDay == nil) {
+		return errors.New("shopping start needs both a day and a month, or neither")
+	}
+	if o.ShopStartMonth != nil {
+		if *o.ShopStartMonth < 1 || *o.ShopStartMonth > 12 {
+			return errors.New("shop_start_month must be 1-12")
+		}
+		if *o.ShopStartDay < 1 || *o.ShopStartDay > daysInMonth(2028, *o.ShopStartMonth) {
+			return errors.New("shopping start day is out of range for that month")
+		}
+	}
 	card, err := getCreditCard(o.CreditCardID)
 	if err != nil {
 		return fmt.Errorf("unknown card: %w", err)
@@ -219,9 +248,9 @@ func AddPresentOccasion(o PresentOccasion) (int64, error) {
 	}
 	var id int64
 	err := database.QueryRow(`
-		INSERT INTO present_occasions (credit_card_id, name, month, day, allowance)
-		VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-		o.CreditCardID, o.Name, o.Month, o.Day, o.Allowance,
+		INSERT INTO present_occasions (credit_card_id, name, month, day, allowance, shop_start_month, shop_start_day)
+		VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+		o.CreditCardID, o.Name, o.Month, o.Day, o.Allowance, o.ShopStartMonth, o.ShopStartDay,
 	).Scan(&id)
 	if err != nil {
 		return 0, err
@@ -234,8 +263,9 @@ func UpdatePresentOccasion(id int64, o PresentOccasion) error {
 		return err
 	}
 	res, err := database.Exec(`
-		UPDATE present_occasions SET credit_card_id=$2, name=$3, month=$4, day=$5, allowance=$6 WHERE id=$1`,
-		id, o.CreditCardID, o.Name, o.Month, o.Day, o.Allowance)
+		UPDATE present_occasions SET credit_card_id=$2, name=$3, month=$4, day=$5, allowance=$6,
+		       shop_start_month=$7, shop_start_day=$8 WHERE id=$1`,
+		id, o.CreditCardID, o.Name, o.Month, o.Day, o.Allowance, o.ShopStartMonth, o.ShopStartDay)
 	if err != nil {
 		return err
 	}
@@ -305,6 +335,9 @@ func presentHolds(occasions []PresentOccasion, cards map[int64]CreditCard, purch
 			continue
 		}
 		start := occ.prev.AddDate(0, 0, 1)
+		if shop, ok := shopStart(occ.occasion, occ.date); ok && shop.After(start) {
+			start = shop
+		}
 		if start.Before(now) {
 			start = now
 		}
